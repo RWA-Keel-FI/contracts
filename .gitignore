@@ -3,3 +3,8 @@ cache/
 .env
 .env.*
 !.env.example
+
+# local secrets
+.env
+.env.*
+!.env.example

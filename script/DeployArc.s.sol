@@ -28,9 +28,10 @@ import {ArcCommon} from "./ArcCommon.sol";
 ///         StockIssuer, a test tTSLA token, SwapRouter, LiquidityRouter, then initialises the hook pool (dynamic fee)
 ///         and the control pool (static 30 bps, no hook) for TSLA/USDC at the live TSLA quote.
 ///
-///         NO liquidity is added here (see SeedLiquidityArc.s.sol, rerunnable). NO oracle price is written here:
-///         `RefPriceOracle.onReport` is callable only by the forwarder, so the first price arrives from the CRE
-///         workflow. Until then `priceOf` returns 0 and the hook FAILS OPEN (every swap pays the base fee).
+///         NO liquidity is added here (see BootstrapArc.s.sol: SeedArc, ShowcaseArc, HandoverArc). NO oracle price is
+///         written here. `RefPriceOracle.onReport` is callable only by the configured forwarder: the deployer
+///         while bootstrapping, the real KeystoneForwarder after HandoverArc (or from the start with
+///         ORACLE_BOOTSTRAP=false). With no price, `priceOf` returns 0 and the hook FAILS OPEN (base fee).
 ///
 ///         Env: DEPLOYER_PRIVATE_KEY (required, from contracts/.env; never logged), PRICE_E8_TSLA, SIGMA_E12_TSLA,
 ///              optional LP1_PRIVATE_KEY, LP2_PRIVATE_KEY, LP3_PRIVATE_KEY, ARB_PRIVATE_KEY, RETAIL_PRIVATE_KEY
@@ -68,7 +69,11 @@ contract DeployArc is ArcCommon {
         require(priceE8 >= 1e8 && priceE8 <= 1_000_000e8, "PRICE_E8_TSLA outside $1..$1,000,000");
 
         vm.startBroadcast(pk);
-        oracle = new RefPriceOracle(FORWARDER); // owner = deployer; onReport only from the real forwarder
+        // BOOTSTRAP (default): the deployer is the TEMPORARY forwarder so it can write one real TSLA quote and mint /
+        // seed liquidity before CRE is feeding the oracle. HandoverArc.s.sol then sets the real KeystoneForwarder.
+        // ORACLE_BOOTSTRAP=false deploys with the real forwarder from the start (no manual price, no mint until CRE writes).
+        bool bootstrap = vm.envOr("ORACLE_BOOTSTRAP", true);
+        oracle = new RefPriceOracle(bootstrap ? deployer : FORWARDER); // owner = deployer
         hook = _deployMinedHook(deployer);
         issuer = new StockIssuer(IERC20(USDC), IRefPriceOracle(address(oracle)), deployer);
         sr = new SwapRouter(IPoolManager(POOL_MANAGER));
@@ -79,7 +84,7 @@ contract DeployArc is ArcCommon {
         _createPools();
         vm.stopBroadcast();
 
-        require(oracle.getForwarderAddress() == FORWARDER, "oracle forwarder mismatch");
+        require(oracle.getForwarderAddress() == (bootstrap ? deployer : FORWARDER), "oracle forwarder mismatch");
         _log(deployer);
     }
 
