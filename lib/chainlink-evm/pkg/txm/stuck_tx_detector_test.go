@@ -1,0 +1,121 @@
+package txm
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+
+	"github.com/smartcontractkit/chainlink-evm/pkg/testutils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txm/types"
+)
+
+func TestTimeBasedDetection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns false if transaction is not stuck", func(t *testing.T) {
+		config := StuckTxDetectorConfig{
+			BlockTime:             10 * time.Second,
+			StuckTxBlockThreshold: 5,
+		}
+		fromAddress := testutils.NewAddress()
+		s := NewStuckTxDetector(logger.Test(t), "", config)
+
+		// No previous broadcast
+		tx := &types.Transaction{
+			ID:              1,
+			LastBroadcastAt: nil,
+			FromAddress:     fromAddress,
+		}
+		assert.False(t, s.timeBasedDetection(tx))
+		// Not enough time has passed since last broadcast
+		now := time.Now()
+		tx.LastBroadcastAt = &now
+		assert.False(t, s.timeBasedDetection(tx))
+		// Not enough time has passed since last purge
+		tx.LastBroadcastAt = &time.Time{}
+		s.lastPurgeMap[fromAddress] = now
+		assert.False(t, s.timeBasedDetection(tx))
+	})
+
+	t.Run("returns true if transaction is stuck", func(t *testing.T) {
+		config := StuckTxDetectorConfig{
+			BlockTime:             10 * time.Second,
+			StuckTxBlockThreshold: 5,
+		}
+		fromAddress := testutils.NewAddress()
+		s := NewStuckTxDetector(logger.Test(t), "", config)
+
+		tx := &types.Transaction{
+			ID:              1,
+			LastBroadcastAt: &time.Time{},
+			FromAddress:     fromAddress,
+		}
+		assert.True(t, s.timeBasedDetection(tx))
+	})
+
+	t.Run("returns true if LastBroadcastAt is nil but attempt count is above threshold", func(t *testing.T) {
+		config := StuckTxDetectorConfig{
+			BlockTime:             10 * time.Second,
+			StuckTxBlockThreshold: 5,
+		}
+		fromAddress := testutils.NewAddress()
+		s := NewStuckTxDetector(logger.Test(t), "", config)
+
+		// This can happen if the transaction was broadcasted multiple times before but got no success messages.
+		tx := &types.Transaction{
+			ID:              1,
+			LastBroadcastAt: nil,
+			FromAddress:     fromAddress,
+			AttemptCount:    maxAttemptsThreshold,
+		}
+		assert.True(t, s.timeBasedDetection(tx))
+	})
+
+	t.Run("marks first tx as stuck, updates purge time for address, and returns false for the second tx with the same broadcast time", func(t *testing.T) {
+		config := StuckTxDetectorConfig{
+			BlockTime:             1 * time.Second,
+			StuckTxBlockThreshold: 10,
+		}
+		fromAddress := testutils.NewAddress()
+		s := NewStuckTxDetector(logger.Test(t), "", config)
+
+		tx1 := &types.Transaction{
+			ID:              1,
+			LastBroadcastAt: &time.Time{},
+			FromAddress:     fromAddress,
+		}
+		tx2 := &types.Transaction{
+			ID:              2,
+			LastBroadcastAt: &time.Time{},
+			FromAddress:     fromAddress,
+		}
+		assert.True(t, s.timeBasedDetection(tx1))
+		assert.False(t, s.timeBasedDetection(tx2))
+	})
+
+	t.Run("safe to call concurrently for different addresses", func(t *testing.T) {
+		config := StuckTxDetectorConfig{
+			BlockTime:             1 * time.Second,
+			StuckTxBlockThreshold: 10,
+		}
+		s := NewStuckTxDetector(logger.Test(t), "", config)
+		lastBroadcastAt := time.Time{}
+
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Go(func() {
+				tx := &types.Transaction{
+					ID:              1,
+					LastBroadcastAt: &lastBroadcastAt,
+					FromAddress:     testutils.NewAddress(),
+				}
+				s.timeBasedDetection(tx)
+			})
+		}
+		wg.Wait()
+	})
+}

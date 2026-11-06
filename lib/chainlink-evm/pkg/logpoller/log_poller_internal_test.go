@@ -1,0 +1,2289 @@
+package logpoller
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
+
+	caperrors "github.com/smartcontractkit/chainlink-common/pkg/capabilities/errors"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/servicetest"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-common/pkg/types/query/primitives"
+	"github.com/smartcontractkit/chainlink-evm/pkg/client/clienttest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/heads/headstest"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller/internal/log_emitter"
+	"github.com/smartcontractkit/chainlink-evm/pkg/testutils"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	"github.com/smartcontractkit/chainlink-evm/pkg/utils"
+)
+
+var (
+	EmitterABI, _ = abi.JSON(strings.NewReader(log_emitter.LogEmitterABI))
+)
+
+// Validate that filters stored in log_filters_table match the filters stored in memory
+func validateFiltersTable(t *testing.T, lp *logPoller, orm ORM) {
+	ctx := t.Context()
+	filters, err := orm.LoadFilters(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(filters), len(lp.filters))
+	for name, dbFilter := range filters {
+		memFilter, ok := lp.filters[name]
+		require.True(t, ok)
+		assert.Truef(t, memFilter.Contains(&dbFilter),
+			"in-memory Filter %s is missing some addresses or events from db Filter table", name)
+		assert.Truef(t, dbFilter.Contains(&memFilter), "db Filter table %s is missing some addresses or events from in-memory Filter", name)
+	}
+}
+
+func TestLogPoller_RegisterFilter(t *testing.T) {
+	t.Parallel()
+	a1 := common.HexToAddress("0x2ab9a2dc53736b361b72d900cdf9f78f9406fbbb")
+	a2 := common.HexToAddress("0x2ab9a2dc53736b361b72d900cdf9f78f9406fbbc")
+
+	lggr, observedLogs := logger.TestObserved(t, zapcore.InfoLevel)
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(t)
+	ctx := t.Context()
+
+	orm := NewORM(chainID, db, lggr)
+
+	// Set up a test chain with a log emitting contract deployed.
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        1,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 1000,
+	}
+	ec := clienttest.NewClient(t)
+	contractCode := []byte{0x60, 0x80, 0x60, 0x40, 0x52}
+	ec.On("CodeAt", mock.Anything, mock.Anything, (*big.Int)(nil)).Return(contractCode, nil).Maybe()
+
+	lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+
+	// We expect a zero Filter if nothing registered yet.
+	f := lp.Filter(nil, nil, nil)
+	require.Len(t, f.Addresses, 1)
+	assert.Equal(t, common.HexToAddress("0x0000000000000000000000000000000000000000"), f.Addresses[0])
+
+	err := lp.RegisterFilter(ctx, Filter{Name: "Emitter Log 1", EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID}, Addresses: []common.Address{a1}})
+	require.NoError(t, err)
+	assert.Equal(t, []common.Address{a1}, lp.Filter(nil, nil, nil).Addresses)
+	assert.Equal(t, [][]common.Hash{{EmitterABI.Events["Log1"].ID}}, lp.Filter(nil, nil, nil).Topics)
+	validateFiltersTable(t, lp, orm)
+	require.Equal(t, 1, observedLogs.Len())
+	require.Contains(t, observedLogs.All()[0].Entry.Message, "Inserted filter")
+
+	// Should de-dupe EventSigs
+	err = lp.RegisterFilter(ctx, Filter{Name: "Emitter Log 1 + 2", EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID, EmitterABI.Events["Log2"].ID}, Addresses: []common.Address{a2}})
+	require.NoError(t, err)
+	assert.Equal(t, []common.Address{a1, a2}, lp.Filter(nil, nil, nil).Addresses)
+	assert.Equal(t, [][]common.Hash{{EmitterABI.Events["Log1"].ID, EmitterABI.Events["Log2"].ID}}, lp.Filter(nil, nil, nil).Topics)
+	validateFiltersTable(t, lp, orm)
+	require.Equal(t, 2, observedLogs.Len())
+	require.Contains(t, observedLogs.All()[1].Entry.Message, "Inserted filter")
+
+	// Should de-dupe Addresses
+	err = lp.RegisterFilter(ctx, Filter{Name: "Emitter Log 1 + 2 dupe", EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID, EmitterABI.Events["Log2"].ID}, Addresses: []common.Address{a2}})
+	require.NoError(t, err)
+	assert.Equal(t, []common.Address{a1, a2}, lp.Filter(nil, nil, nil).Addresses)
+	assert.Equal(t, [][]common.Hash{{EmitterABI.Events["Log1"].ID, EmitterABI.Events["Log2"].ID}}, lp.Filter(nil, nil, nil).Topics)
+	validateFiltersTable(t, lp, orm)
+	require.Equal(t, 3, observedLogs.Len())
+	require.Contains(t, observedLogs.All()[2].Entry.Message, "Inserted filter")
+
+	// Address required.
+	err = lp.RegisterFilter(ctx, Filter{Name: "no address", EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID}})
+	require.Error(t, err)
+	// Event required
+	err = lp.RegisterFilter(ctx, Filter{Name: "No event", Addresses: []common.Address{a1}})
+	require.Error(t, err)
+	validateFiltersTable(t, lp, orm)
+
+	// Removing non-existence Filter should log error but return nil
+	err = lp.UnregisterFilter(ctx, "Filter doesn't exist")
+	require.NoError(t, err)
+	require.Equal(t, 4, observedLogs.Len())
+	require.Contains(t, observedLogs.All()[3].Entry.Message, "not found")
+
+	// Check that all filters are still there
+	_, ok := lp.filters["Emitter Log 1"]
+	require.True(t, ok, "'Emitter Log 1 Filter' missing")
+	_, ok = lp.filters["Emitter Log 1 + 2"]
+	require.True(t, ok, "'Emitter Log 1 + 2' Filter missing")
+	_, ok = lp.filters["Emitter Log 1 + 2 dupe"]
+	require.True(t, ok, "'Emitter Log 1 + 2 dupe' Filter missing")
+
+	// Removing an existing Filter should remove it from both memory and db
+	err = lp.UnregisterFilter(ctx, "Emitter Log 1 + 2")
+	require.NoError(t, err)
+	_, ok = lp.filters["Emitter Log 1 + 2"]
+	require.False(t, ok, "'Emitter Log 1 Filter' should have been removed by UnregisterFilter()")
+	require.Len(t, lp.filters, 2)
+	validateFiltersTable(t, lp, orm)
+
+	err = lp.UnregisterFilter(ctx, "Emitter Log 1 + 2 dupe")
+	require.NoError(t, err)
+	err = lp.UnregisterFilter(ctx, "Emitter Log 1")
+	require.NoError(t, err)
+	assert.Empty(t, lp.filters)
+	filters, err := lp.orm.LoadFilters(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, filters)
+
+	// Make sure cache was invalidated
+	assert.Len(t, lp.Filter(nil, nil, nil).Addresses, 1)
+	assert.Equal(t, lp.Filter(nil, nil, nil).Addresses[0], common.HexToAddress("0x0000000000000000000000000000000000000000"))
+	assert.Len(t, lp.Filter(nil, nil, nil).Topics, 1)
+	assert.Empty(t, lp.Filter(nil, nil, nil).Topics[0])
+}
+
+func TestLogPoller_RegisterFilter_ContractValidation(t *testing.T) {
+	t.Parallel()
+	contractAddr := common.HexToAddress("0x2ab9a2dc53736b361b72d900cdf9f78f9406fbbb")
+	contractCode := []byte{0x60, 0x80, 0x60, 0x40, 0x52}
+
+	eoaAddr := common.HexToAddress("0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb") // Example EOA address
+
+	lggr, _ := logger.TestObserved(t, zapcore.InfoLevel)
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(t)
+	ctx := t.Context()
+
+	orm := NewORM(chainID, db, lggr)
+	ec := clienttest.NewClient(t)
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        1,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 1000,
+	}
+
+	t.Run("rejects EOA address", func(t *testing.T) {
+		lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+
+		ec.On("CodeAt", mock.Anything, eoaAddr, (*big.Int)(nil)).Return([]byte{}, nil).Once()
+
+		err := lp.RegisterFilter(ctx, Filter{
+			Name:      "test-filter-eoa",
+			EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+			Addresses: []common.Address{eoaAddr},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not contracts")
+		require.Contains(t, err.Error(), eoaAddr.Hex())
+		require.Contains(t, err.Error(), "EOA, not a contract")
+
+		var capErr caperrors.Error
+		require.True(t, errors.As(err, &capErr), "error should be a caperrors.Error")
+		require.Equal(t, caperrors.OriginUser, capErr.Origin(), "error should have user origin")
+		require.Equal(t, caperrors.VisibilityPublic, capErr.Visibility(), "error should be public")
+		require.Equal(t, caperrors.InvalidArgument, capErr.Code(), "error should have InvalidArgument code")
+	})
+
+	t.Run("accepts contract address", func(t *testing.T) {
+		lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+
+		ec.On("CodeAt", mock.Anything, contractAddr, (*big.Int)(nil)).Return(contractCode, nil).Once()
+
+		err := lp.RegisterFilter(ctx, Filter{
+			Name:      "test-filter-contract",
+			EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+			Addresses: []common.Address{contractAddr},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects mix of contracts and EOAs", func(t *testing.T) {
+		lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+
+		ec.On("CodeAt", mock.Anything, contractAddr, (*big.Int)(nil)).Return(contractCode, nil).Once()
+		ec.On("CodeAt", mock.Anything, eoaAddr, (*big.Int)(nil)).Return([]byte{}, nil).Once()
+
+		err := lp.RegisterFilter(ctx, Filter{
+			Name:      "test-filter-mixed",
+			EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+			Addresses: []common.Address{contractAddr, eoaAddr},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not contracts")
+		require.Contains(t, err.Error(), eoaAddr.Hex())
+		require.Contains(t, err.Error(), "index 1") // Second address (index 1) is the EOA
+
+		var capErr caperrors.Error
+		require.True(t, errors.As(err, &capErr), "error should be a caperrors.Error")
+		require.Equal(t, caperrors.OriginUser, capErr.Origin(), "error should have user origin")
+		require.Equal(t, caperrors.VisibilityPublic, capErr.Visibility(), "error should be public")
+		require.Equal(t, caperrors.InvalidArgument, capErr.Code(), "error should have InvalidArgument code")
+	})
+
+	t.Run("handles CodeAt RPC failure", func(t *testing.T) {
+		lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+
+		rpcError := errors.New("RPC connection failed")
+		ec.On("CodeAt", mock.Anything, contractAddr, (*big.Int)(nil)).Return(nil, rpcError).Once()
+
+		err := lp.RegisterFilter(ctx, Filter{
+			Name:      "test-filter-rpc-error",
+			EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+			Addresses: []common.Address{contractAddr},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check if address")
+		require.Contains(t, err.Error(), contractAddr.Hex())
+
+		var capErr caperrors.Error
+		require.True(t, errors.As(err, &capErr), "error should be a caperrors.Error")
+		require.Equal(t, caperrors.OriginSystem, capErr.Origin(), "RPC failure should be a system error, not user error")
+		require.Equal(t, caperrors.VisibilityPublic, capErr.Visibility(), "error should be public")
+		require.Equal(t, caperrors.Unknown, capErr.Code(), "error should have Unknown code")
+	})
+
+}
+
+func TestLogPoller_ConvertLogs(t *testing.T) {
+	t.Parallel()
+	lggr := logger.Test(t)
+
+	topics := []common.Hash{EmitterABI.Events["Log1"].ID}
+
+	var cases = []struct {
+		name     string
+		logs     []types.Log
+		blocks   []Block
+		expected int
+	}{
+		{"SingleBlock",
+			[]types.Log{{Topics: topics}, {Topics: topics}},
+			[]Block{{BlockTimestamp: time.Now()}},
+			2},
+		{"BlockList",
+			[]types.Log{{Topics: topics}, {Topics: topics}, {Topics: topics}},
+			[]Block{{BlockTimestamp: time.Now()}},
+			3},
+		{"EmptyList",
+			[]types.Log{},
+			[]Block{},
+			0},
+		{"TooManyBlocks",
+			[]types.Log{{}},
+			[]Block{{}, {}},
+			0},
+		{"TooFewBlocks",
+			[]types.Log{{}, {}, {}},
+			[]Block{{}, {}},
+			0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			logs := convertLogs(c.logs, c.blocks, lggr, big.NewInt(53))
+			require.Len(t, logs, c.expected)
+			for i := 0; i < c.expected; i++ {
+				if len(c.blocks) == 1 {
+					assert.Equal(t, c.blocks[0].BlockTimestamp, logs[i].BlockTimestamp)
+				} else {
+					assert.Equal(t, logs[i].BlockTimestamp, c.blocks[i].BlockTimestamp)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterName(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "a - b:c:d", FilterName("a", "b", "c", "d"))
+	assert.Equal(t, "empty args test", FilterName("empty args test"))
+}
+
+func TestLogPoller_BackupPollerStartup(t *testing.T) {
+	t.Parallel()
+
+	t.Run("assert backup poller (safe tag < finalized < latest)", func(t *testing.T) {
+		latestBlock := int64(4)
+		const finalityDepth = 2
+		head := &evmtypes.Head{Number: latestBlock}
+		finalizedHead := &evmtypes.Head{Number: latestBlock - finalityDepth}
+		safeHead := &evmtypes.Head{Number: latestBlock - finalityDepth - 1} // forcing safe head to be lower than finalized head
+		expectedSafeBlockNumber := finalizedHead.Number
+		assertBackupPollerStartup(t, head, finalizedHead, safeHead, finalityDepth, expectedSafeBlockNumber)
+	})
+
+	t.Run("assert backup poller (finalized < safe tag < latest)", func(t *testing.T) {
+		latestBlock := int64(4)
+		const finalityDepth = 2
+		head := &evmtypes.Head{Number: latestBlock}
+		safeHead := &evmtypes.Head{Number: latestBlock - 1} // forcing safe head to be lower than latest head but higher than finalized head
+		finalizedHead := &evmtypes.Head{Number: latestBlock - finalityDepth}
+		expectedSafeBlockNumber := safeHead.Number
+		assertBackupPollerStartup(t, head, finalizedHead, safeHead, finalityDepth, expectedSafeBlockNumber)
+	})
+}
+
+func assertBackupPollerStartup(t *testing.T, head *evmtypes.Head, finalizedHead *evmtypes.Head, safeHead *evmtypes.Head, finalityDepth int64, expectedSafeBlockNumber int64) {
+	addr := common.HexToAddress("0x2ab9a2dc53736b361b72d900cdf9f78f9406fbbc")
+	lggr, observedLogs := logger.TestObserved(t, zapcore.WarnLevel)
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(t)
+	orm := NewORM(chainID, db, lggr)
+
+	events := []common.Hash{EmitterABI.Events["Log1"].ID}
+	log1 := types.Log{
+		Index:       0,
+		BlockHash:   common.Hash{},
+		BlockNumber: uint64(head.Number), //nolint:gosec // G115
+		Topics:      events,
+		Address:     addr,
+		TxHash:      common.HexToHash("0x1234"),
+		Data:        EvmWord(uint64(300)).Bytes(),
+	}
+
+	ec := clienttest.NewClient(t)
+	ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil)
+	ec.On("ConfiguredChainID").Return(chainID, nil)
+
+	headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+	headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalizedHead, nil)
+	headTracker.On("LatestSafeBlock", mock.Anything).Return(safeHead, nil)
+
+	ctx := t.Context()
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		FinalityDepth:            finalityDepth,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 1000,
+		BackupPollerBlockDelay:   0,
+	}
+	lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+	require.NoError(t, lp.BackupPollAndSaveLogs(ctx))
+	assert.Equal(t, int64(0), lp.backupPollerNextBlock)
+	assert.Equal(t, 1, observedLogs.FilterMessageSnippet("ran before first successful log poller run").Len())
+
+	lp.PollAndSaveLogs(ctx, head.Number, false)
+
+	lastProcessed, err := lp.orm.SelectLatestBlock(ctx)
+	require.NoError(t, err)
+	require.Equal(t, head.Number, lastProcessed.BlockNumber)
+	require.Equal(t, expectedSafeBlockNumber, lastProcessed.SafeBlockNumber)
+
+	require.NoError(t, lp.BackupPollAndSaveLogs(ctx))
+	assert.Equal(t, int64(2), lp.backupPollerNextBlock)
+}
+
+func mockBatchCallContext(t *testing.T, ec *clienttest.Client) {
+	mockBatchCallContextWithHead(t, ec, newHeadVal)
+}
+
+func hashOf(n int64) common.Hash {
+	return common.BigToHash(big.NewInt(n))
+}
+
+func newHeadVal(num int64) evmtypes.Head {
+	return evmtypes.Head{
+		Number:     num,
+		Hash:       hashOf(num),
+		ParentHash: hashOf(num - 1),
+	}
+}
+
+func newHead(num int64) *evmtypes.Head {
+	r := newHeadVal(num)
+	return &r
+}
+
+func mockBatchCallContextWithHead(t *testing.T, ec *clienttest.Client, newHead func(num int64) evmtypes.Head) {
+	ec.On("BatchCallContext", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		elems := args.Get(1).([]rpc.BatchElem)
+		for i, e := range elems {
+			var num int64
+			block := e.Args[0].(string)
+			switch block {
+			case "latest":
+				num = 8
+			case "finalized":
+				num = 5
+			default:
+				n, err := hexutil.DecodeUint64(block)
+				require.NoError(t, err)
+				num = int64(n)
+				if num == 0 {
+					elems[i].Error = errors.New("block 0 is not available")
+					continue
+				}
+			}
+			result := e.Result.(*evmtypes.Head)
+			*result = newHead(num)
+		}
+	})
+}
+
+func TestLogPoller_Replay(t *testing.T) {
+	t.Parallel()
+	addr := common.HexToAddress("0x2ab9a2dc53736b361b72d900cdf9f78f9406fbbc")
+
+	lggr, observedLogs := logger.TestObserved(t, zapcore.ErrorLevel)
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(t)
+	orm := NewORM(chainID, db, lggr)
+
+	var head atomic.Pointer[evmtypes.Head]
+	head.Store(newHead(4))
+
+	events := []common.Hash{EmitterABI.Events["Log1"].ID}
+	log1 := types.Log{
+		Index:       0,
+		BlockHash:   common.BigToHash(big.NewInt(head.Load().Number)),
+		BlockNumber: uint64(head.Load().Number),
+		Topics:      events,
+		Address:     addr,
+		TxHash:      common.HexToHash("0x1234"),
+		Data:        EvmWord(uint64(300)).Bytes(),
+	}
+
+	ec := clienttest.NewClient(t)
+	ec.EXPECT().HeadByHash(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, hash common.Hash) (*evmtypes.Head, error) {
+		return &evmtypes.Head{Number: hash.Big().Int64(), Hash: hash}, nil
+	}).Maybe()
+	ec.On("HeadByNumber", mock.Anything, mock.Anything).Return(func(_ context.Context, num *big.Int) (*evmtypes.Head, error) {
+		if num == nil {
+			return head.Load(), nil
+		}
+		return newHead(num.Int64()), nil
+	})
+	ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil).Once()
+	ec.On("ConfiguredChainID").Return(chainID, nil)
+
+	lpOpts := Opts{
+		PollPeriod:               time.Second,
+		FinalityDepth:            3,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             3,
+		KeepFinalizedBlocksDepth: 20,
+		BackupPollerBlockDelay:   0,
+	}
+	headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+
+	headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(func(ctx context.Context) (*evmtypes.Head, *evmtypes.Head, error) {
+		h := head.Load()
+		finalized := newHead(h.Number - lpOpts.FinalityDepth)
+		return h, finalized, nil
+	})
+	headTracker.EXPECT().LatestSafeBlock(mock.Anything).RunAndReturn(func(ctx context.Context) (*evmtypes.Head, error) {
+		h := head.Load()
+		safe := newHead(h.Number - lpOpts.FinalityDepth)
+		return safe, nil
+	})
+	lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+
+	{
+		ctx := t.Context()
+		// process 1 log in block 3
+		lp.PollAndSaveLogs(ctx, 4, false)
+		latest, err := lp.LatestBlock(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(4), latest.BlockNumber)
+		require.Equal(t, int64(1), latest.FinalizedBlockNumber)
+	}
+
+	t.Run("abort before replayStart received", func(t *testing.T) {
+		// Replay() should abort immediately if caller's context is cancelled before request signal is read
+		cancelCtx, cancel := context.WithCancel(t.Context())
+		cancel()
+		err := lp.Replay(cancelCtx, 3)
+		assert.ErrorIs(t, err, ErrReplayRequestAborted)
+	})
+
+	recvStartReplay := func(t *testing.T, ctx context.Context, block int64) {
+		select {
+		case fromBlock := <-lp.replayStart:
+			assert.Equal(t, block, fromBlock)
+		case <-ctx.Done():
+			assert.NoError(t, ctx.Err(), "Timed out waiting to receive replay request from lp.replayStart")
+		}
+	}
+
+	// Replay() should return error code received from replayComplete
+	t.Run("returns error code on replay complete", func(t *testing.T) {
+		ctx := t.Context()
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil).Once()
+		mockBatchCallContext(t, ec)
+		anyErr := pkgerrors.New("any error")
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			recvStartReplay(t, ctx, 2)
+			lp.replayComplete <- anyErr
+		}()
+		assert.ErrorIs(t, lp.Replay(ctx, 1), anyErr)
+		<-done
+	})
+
+	// Replay() should return ErrReplayInProgress if caller's context is cancelled after replay has begun
+	t.Run("late abort returns ErrReplayInProgress", func(t *testing.T) {
+		cancelCtx, cancel := context.WithTimeout(t.Context(), time.Second) // Intentionally abort replay after 1s
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			recvStartReplay(t, cancelCtx, 4)
+			cancel()
+		}()
+		assert.ErrorIs(t, lp.Replay(cancelCtx, 4), ErrReplayInProgress)
+		<-done
+		lp.replayComplete <- nil
+		lp.wg.Wait()
+	})
+
+	// Main lp.run() loop shouldn't get stuck if client aborts
+	t.Run("client abort doesnt hang run loop", func(t *testing.T) {
+		ctx := t.Context()
+		lp.backupPollerNextBlock = 0
+
+		pass := make(chan struct{})
+		cancelled := make(chan struct{})
+
+		rctx, rcancel := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		defer func() { wg.Wait() }()
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Once().Return([]types.Log{log1}, nil).Run(func(args mock.Arguments) {
+			head.Store(newHead(4))
+			wg.Go(func() {
+				assert.ErrorIs(t, lp.Replay(rctx, 4), ErrReplayInProgress)
+				close(cancelled)
+			})
+		})
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Once().Return([]types.Log{log1}, nil).Run(func(args mock.Arguments) {
+			rcancel()
+			wg.Go(func() {
+				select {
+				case lp.replayStart <- 4:
+					close(pass)
+				case <-ctx.Done():
+					return
+				}
+			})
+			// We cannot return until we're sure that Replay() received the cancellation signal,
+			// otherwise replayComplete<- might be sent first
+			<-cancelled
+		})
+
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil).Maybe() // in case task gets delayed by >= 100ms
+
+		head.Store(newHead(5))
+		t.Cleanup(lp.reset)
+		servicetest.Run(t, lp)
+
+		select {
+		case <-ctx.Done():
+			t.Errorf("timed out waiting for lp.run() to respond to second replay event")
+		case <-pass:
+		}
+	})
+
+	// remove Maybe expectation from prior subtest, as it will override all expected calls in future subtests
+	ec.On("FilterLogs", mock.Anything, mock.Anything).Unset()
+
+	// run() should abort if log poller shuts down while replay is in progress
+	t.Run("shutdown during replay", func(t *testing.T) {
+		ctx := t.Context()
+		lp.backupPollerNextBlock = 0
+
+		pass := make(chan struct{})
+		done := make(chan struct{})
+		defer func() { <-done }()
+
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Once().Return([]types.Log{log1}, nil).Run(func(args mock.Arguments) {
+			go func() {
+				defer close(done)
+
+				head.Store(newHead(4)) // Restore latest block to 4, so this matches the fromBlock requested
+				select {
+				case lp.replayStart <- 4:
+				case <-ctx.Done():
+				}
+			}()
+		})
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Once().Return([]types.Log{log1}, nil).Run(func(args mock.Arguments) {
+			go func() {
+				assert.NoError(t, lp.Close())
+
+				// prevent double close
+				lp.reset()
+				assert.NoError(t, lp.Start(ctx))
+
+				close(pass)
+			}()
+		})
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil)
+
+		t.Cleanup(lp.reset)
+		head.Store(newHead(6)) // Latest block must be > lastProcessed in order for SaveAndPollLogs() to call FilterLogs()
+		servicetest.Run(t, lp)
+
+		select {
+		case <-ctx.Done():
+			t.Error("timed out waiting for lp.run() to respond to shutdown event during replay")
+		case <-pass:
+		}
+	})
+
+	// ReplayAsync should return as soon as replayStart is received
+	t.Run("ReplayAsync success", func(t *testing.T) {
+		t.Cleanup(lp.reset)
+
+		head.Store(newHead(5))
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil)
+		mockBatchCallContext(t, ec)
+		servicetest.Run(t, lp)
+
+		lp.ReplayAsync(1)
+
+		recvStartReplay(t, t.Context(), 4)
+	})
+
+	t.Run("ReplayAsync error", func(t *testing.T) {
+		ctx := t.Context()
+		t.Cleanup(lp.reset)
+		servicetest.Run(t, lp)
+		head.Store(newHead(4))
+
+		anyErr := pkgerrors.New("async error")
+		observedLogs.TakeAll()
+
+		lp.ReplayAsync(4)
+		recvStartReplay(t, t.Context(), 4)
+
+		select {
+		case lp.replayComplete <- anyErr:
+			time.Sleep(2 * time.Second)
+		case <-ctx.Done():
+			t.Error("timed out waiting to send replaceComplete")
+		}
+		require.Equal(t, 1, observedLogs.Len())
+		assert.Equal(t, observedLogs.All()[0].Message, anyErr.Error())
+	})
+
+	t.Run("run regular replay when there are not blocks in db", func(t *testing.T) {
+		ctx := t.Context()
+		err := lp.orm.DeleteLogsAndBlocksAfter(ctx, 0)
+		require.NoError(t, err)
+
+		lp.ReplayAsync(1)
+		recvStartReplay(t, t.Context(), 1)
+	})
+
+	t.Run("run only backfill when everything is finalized", func(t *testing.T) {
+		ctx := t.Context()
+		err := lp.orm.DeleteLogsAndBlocksAfter(ctx, 0)
+		require.NoError(t, err)
+
+		h := head.Load()
+		err = lp.orm.InsertBlock(ctx, common.BigToHash(big.NewInt(h.Number)), h.Number, h.Timestamp, h.Number, h.Number)
+		require.NoError(t, err)
+
+		ec.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{log1}, nil)
+		mockBatchCallContext(t, ec)
+
+		err = lp.Replay(ctx, 1)
+		require.NoError(t, err)
+	})
+}
+
+// TestLogPoller_Close_RecvReplayComplete_NoDeadlock is a regression test for the scenario
+// where Close() hangs in wg.Wait() because recvReplayComplete blocks forever on <-replayComplete.
+//
+// Sequence that previously deadlocked:
+//  1. Replay's ctx fires Done → Replay spawns recvReplayComplete (wg.Add(1)) and returns ErrReplayInProgress.
+//  2. Close's single non-blocking send to replayComplete fires to default (recvReplayComplete not yet receiving).
+//  3. close(stopCh) then wg.Wait() — recvReplayComplete blocks on <-replayComplete forever, wg never drains.
+//
+// Fix: recvReplayComplete also selects on stopCh so it exits when the poller shuts down.
+func TestLogPoller_Close_RecvReplayComplete_NoDeadlock(t *testing.T) {
+	t.Parallel()
+
+	lggr := logger.Test(t)
+	lp := NewLogPoller(nil, nil, lggr, nil, Opts{PollPeriod: time.Hour})
+
+	// Reproduce the race: Close's non-blocking send already went to default before
+	// recvReplayComplete was scheduled, then stopCh was closed. No replayComplete value
+	// will ever arrive; recvReplayComplete must exit via stopCh or wg.Wait() hangs.
+	close(lp.stopCh)
+
+	lp.wg.Add(1)
+	go lp.recvReplayComplete()
+
+	done := make(chan struct{})
+	go func() { lp.wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("recvReplayComplete blocked on <-replayComplete after stopCh closed; Close() would deadlock")
+	}
+}
+
+func TestLogPoller_Replay_nilLatestHead(t *testing.T) {
+	t.Parallel()
+	lggr := logger.Test(t)
+	ec := clienttest.NewClient(t)
+	ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).Return(nil, nil).Once()
+	// Nil ORM is sufficient: Replay returns after HeadByNumber before touching the database.
+	lp := NewLogPoller(nil, ec, lggr, nil, Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        1,
+		RPCBatchSize:             1,
+		KeepFinalizedBlocksDepth: 20,
+	})
+	err := lp.Replay(t.Context(), 1)
+	require.ErrorContains(t, err, "expected latest block to be non-nil")
+}
+
+func (lp *logPoller) reset() {
+	lp.StateMachine = services.StateMachine{}
+	lp.stopCh = make(chan struct{})
+}
+
+func Test_latestBlockAndFinalityDepth(t *testing.T) {
+	lggr := logger.Test(t)
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             3,
+		KeepFinalizedBlocksDepth: 20,
+	}
+
+	t.Run("headTracker returns an error", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		const expectedError = "finalized block is not available yet"
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(&evmtypes.Head{}, &evmtypes.Head{}, errors.New(expectedError))
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, _, err := lp.latestAndFinalizedBlocks(t.Context())
+		require.ErrorContains(t, err, expectedError)
+	})
+	t.Run("headTracker returns valid chain", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalizedBlock := &evmtypes.Head{Number: 2}
+		finalizedBlock.IsFinalized.Store(true)
+		head := &evmtypes.Head{Number: 10}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalizedBlock, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		latestBlock, finalizedBlockNumber, err := lp.latestAndFinalizedBlocks(t.Context())
+		require.NoError(t, err)
+		require.NotNil(t, latestBlock)
+		assert.Equal(t, head.BlockNumber(), latestBlock.BlockNumber())
+		assert.Equal(t, finalizedBlock.Number, finalizedBlockNumber)
+	})
+	t.Run("finalized ahead of latest", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 5, Hash: common.Hash{0x01}}
+		finalized := &evmtypes.Head{Number: 12, Hash: common.Hash{0x02}}
+		finalized.IsFinalized.Store(true)
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		latestBlock, finalizedBlockNumber, err := lp.latestAndFinalizedBlocks(t.Context())
+		require.NoError(t, err)
+		// Since finalized >= latest, we should return the finalized block as the latest.
+		require.Same(t, finalized, latestBlock)
+		assert.Equal(t, int64(12), finalizedBlockNumber)
+		assert.Equal(t, finalized.BlockNumber(), latestBlock.BlockNumber())
+	})
+	t.Run("headTracker returns nil latest with nil error", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalizedBlock := &evmtypes.Head{Number: 1}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(nil, finalizedBlock, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, _, err := lp.latestAndFinalizedBlocks(t.Context())
+		require.ErrorContains(t, err, "expected non-nil latest block from HeadTracker")
+	})
+	t.Run("headTracker returns nil finalized with nil error", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 10}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, nil, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, _, err := lp.latestAndFinalizedBlocks(t.Context())
+		require.ErrorContains(t, err, "expected non-nil finalized block from HeadTracker")
+	})
+}
+
+func Test_latestBlocks(t *testing.T) {
+	lggr := logger.Test(t)
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             3,
+		KeepFinalizedBlocksDepth: 20,
+	}
+
+	t.Run("headTracker returns an error", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		const expectedError = "safe block is not available yet"
+		head := &evmtypes.Head{Number: 10}
+		finalized := &evmtypes.Head{Number: 1}
+		finalized.IsFinalized.Store(true)
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(&evmtypes.Head{}, errors.New(expectedError))
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, _, _, err := lp.latestBlocks(t.Context())
+		require.ErrorContains(t, err, expectedError)
+	})
+	t.Run("headTracker returns valid chain", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 10}
+		finalized := &evmtypes.Head{Number: 1}
+		finalized.IsFinalized.Store(true)
+		safeBlock := &evmtypes.Head{Number: 2}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(safeBlock, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, safeBlockNumber, finalizedBlockNumber, err := lp.latestBlocks(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, finalized.Number, finalizedBlockNumber)
+		assert.Equal(t, safeBlock.Number, safeBlockNumber)
+	})
+	t.Run("headTracker returns valid chain but safe is lower than finalized", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 10}
+		finalized := &evmtypes.Head{Number: 3}
+		finalized.IsFinalized.Store(true)
+		safeBlock := &evmtypes.Head{Number: 2}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(safeBlock, nil)
+		latestFinalizedBlockNumber := int64(3)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, safeBlockNumber, finalizedBN, err := lp.latestBlocks(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, latestFinalizedBlockNumber, finalizedBN)
+		assert.Equal(t, latestFinalizedBlockNumber, safeBlockNumber)
+	})
+	t.Run("headTracker returns nil safe with nil error", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 10}
+		finalized := &evmtypes.Head{Number: 1}
+		finalized.IsFinalized.Store(true)
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(nil, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		_, _, _, err := lp.latestBlocks(t.Context())
+		require.ErrorContains(t, err, "expected non-nil safe block from HeadTracker")
+	})
+	t.Run("safe ahead of latest bumps returned latest to safe head", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 8, Hash: common.Hash{0x11}}
+		finalized := &evmtypes.Head{Number: 2}
+		finalized.IsFinalized.Store(true)
+		safe := &evmtypes.Head{Number: 15, Hash: common.Hash{0x22}}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(safe, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		latestHead, safeBlockNumber, finalizedBN, err := lp.latestBlocks(t.Context())
+		require.NoError(t, err)
+		require.Same(t, safe, latestHead)
+		assert.Equal(t, int64(15), safeBlockNumber)
+		assert.Equal(t, finalized.Number, finalizedBN)
+	})
+	t.Run("finalized ahead of latest then safe ahead of adjusted latest", func(t *testing.T) {
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		head := &evmtypes.Head{Number: 3}
+		finalized := &evmtypes.Head{Number: 20, Hash: common.Hash{0xaa}}
+		finalized.IsFinalized.Store(true)
+		safe := &evmtypes.Head{Number: 25, Hash: common.Hash{0xbb}}
+		headTracker.On("LatestAndFinalizedBlock", mock.Anything).Return(head, finalized, nil)
+		headTracker.On("LatestSafeBlock", mock.Anything).Return(safe, nil)
+
+		lp := NewLogPoller(nil, nil, lggr, headTracker, lpOpts)
+		latestHead, safeBlockNumber, finalizedBN, err := lp.latestBlocks(t.Context())
+		require.NoError(t, err)
+		require.Same(t, safe, latestHead)
+		assert.Equal(t, int64(25), safeBlockNumber)
+		assert.Equal(t, finalized.Number, finalizedBN)
+	})
+}
+
+func Test_FetchBlocks(t *testing.T) {
+	lggr := logger.Test(t)
+	chainID := testutils.FixtureChainID
+	db := testutils.NewSqlxDB(t)
+	orm := NewORM(chainID, db, lggr)
+	ctx := t.Context()
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		BackfillBatchSize:        2,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 50,
+		FinalityDepth:            3,
+	}
+
+	ec := clienttest.NewClient(t)
+	mockBatchCallContext(t, ec) // This will return 5 for "finalized" and 8 for "latest"
+
+	cases := []struct {
+		name            string
+		blocksRequested []uint64
+		chainReference  *Block
+		expectedErr     error
+	}{
+		{
+			"All blocks are finalized from RPC's perspective, no reference",
+			[]uint64{2, 5, 3, 4},
+			nil,
+			nil,
+		},
+		{
+			"RPC's latest finalized is lower than request, no reference",
+			[]uint64{8, 2},
+			nil,
+			errors.New("received unfinalized block 8 while expecting finalized block (latestFinalizedBlockNumber = 5)"),
+		},
+		{
+			"All blocks are finalized, but chain reference does not match",
+			[]uint64{2, 5, 3, 4},
+			&Block{BlockNumber: 1, BlockHash: common.BigToHash(big.NewInt(2))},
+			errors.New("expected RPC's finalized block hash at hegiht 1 to be 0x0000000000000000000000000000000000000000000000000000000000000002 but got 0x0000000000000000000000000000000000000000000000000000000000000001: finality violated"),
+		},
+		{
+			"All blocks are finalized and chain reference matches",
+			[]uint64{2, 5, 3, 4},
+			&Block{BlockNumber: 1, BlockHash: common.BigToHash(big.NewInt(1))},
+			nil,
+		},
+		{
+			"One block is not available",
+			[]uint64{0, 1, 2, 3},
+			nil,
+			errors.New("one of requests in batch failed: block 0 is not available"),
+		},
+	}
+
+	lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+	for _, tc := range cases {
+		for _, lp.useFinalityTag = range []bool{false, true} {
+			blockValidationReq := latestBlock
+			if lp.useFinalityTag {
+				blockValidationReq = finalizedBlock
+			}
+			t.Run(fmt.Sprintf("%s where useFinalityTag=%t", tc.name, lp.useFinalityTag), func(t *testing.T) {
+				blocks, err := lp.fetchBlocks(ctx, tc.blocksRequested, blockValidationReq, tc.chainReference)
+				if tc.expectedErr != nil {
+					require.Equal(t, err.Error(), tc.expectedErr.Error())
+					return // PASS
+				}
+				require.NoError(t, err)
+				for _, blockRequested := range tc.blocksRequested {
+					assert.Equal(t, blockRequested, uint64(blocks[blockRequested].Number)) //nolint:gosec // G115
+				}
+			})
+		}
+	}
+}
+
+func Test_PollAndSaveLogs_BackfillFinalityViolation(t *testing.T) {
+	t.Parallel()
+
+	db := testutils.NewSqlxDB(t)
+	lpOpts := Opts{
+		PollPeriod:               time.Second,
+		FinalityDepth:            3,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             3,
+		KeepFinalizedBlocksDepth: 20,
+		BackupPollerBlockDelay:   0,
+	}
+	t.Run("Finalized DB block is not present in RPC's chain - detected in getCurrentBlockMaybeHandleReorg", func(t *testing.T) {
+		lggr, _ := logger.TestObserved(t, zapcore.ErrorLevel)
+		orm := NewORM(testutils.NewRandomEVMChainID(), db, lggr)
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalized := newHead(5)
+		latest := newHead(16)
+		headTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).RunAndReturn(func(ctx context.Context) (*evmtypes.Head, *evmtypes.Head, error) {
+			return latest, finalized, nil
+		}).Once()
+		headTracker.EXPECT().LatestSafeBlock(mock.Anything).Return(finalized, nil).Once()
+		ec := clienttest.NewClient(t)
+		ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, number *big.Int) (*evmtypes.Head, error) {
+			return newHead(number.Int64()), nil
+		})
+		// insert finalized block with different hash than in RPC
+		require.NoError(t, orm.InsertBlock(t.Context(), common.HexToHash("0x124"), 3, time.Unix(10, 0), 2, 2))
+		require.NoError(t, orm.InsertBlock(t.Context(), common.HexToHash("0x123"), 2, time.Unix(10, 0), 2, 2))
+		lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+		lp.PollAndSaveLogs(t.Context(), 4, false)
+		require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated)
+	})
+	t.Run("Finalized DB block is not present in RPC's chain - detected during backfill", func(t *testing.T) {
+		lggr, _ := logger.TestObserved(t, zapcore.ErrorLevel)
+		orm := NewORM(testutils.NewRandomEVMChainID(), db, lggr)
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		ec := clienttest.NewClient(t)
+		mockBatchCallContext(t, ec)
+		// insert finalized block with different hash than in RPC
+		require.NoError(t, orm.InsertBlock(t.Context(), common.HexToHash("0x124"), 3, time.Unix(10, 0), 2, 2))
+		require.NoError(t, orm.InsertBlock(t.Context(), common.HexToHash("0x123"), 2, time.Unix(10, 0), 2, 2))
+		ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return(nil, nil).Once()
+		lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+		err := lp.backfill(t.Context(), 3, 5)
+		require.ErrorIs(t, err, commontypes.ErrFinalityViolated)
+	})
+	t.Run("RPCs contradict each other and return different finalized blocks", func(t *testing.T) {
+		lggr, _ := logger.TestObserved(t, zapcore.ErrorLevel)
+		orm := NewORM(testutils.NewRandomEVMChainID(), db, lggr)
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalized := newHead(5)
+		latest := newHead(16)
+		headTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latest, finalized, nil).Once()
+		headTracker.EXPECT().LatestSafeBlock(mock.Anything).Return(finalized, nil).Once()
+		ec := clienttest.NewClient(t)
+		ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, number *big.Int) (*evmtypes.Head, error) {
+			return newHead(number.Int64()), nil
+		})
+		ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return([]types.Log{{BlockNumber: 5}}, nil).Once()
+		mockBatchCallContextWithHead(t, ec, func(num int64) evmtypes.Head {
+			// return new hash for every call
+			return evmtypes.Head{Number: num, Hash: utils.NewHash()}
+		})
+		lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+		lp.PollAndSaveLogs(t.Context(), 4, false)
+		require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated)
+	})
+	t.Run("Log's hash does not match block's", func(t *testing.T) {
+		lggr, _ := logger.TestObserved(t, zapcore.ErrorLevel)
+		orm := NewORM(testutils.NewRandomEVMChainID(), db, lggr)
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalized := newHead(5)
+		latest := newHead(16)
+		headTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latest, finalized, nil).Once()
+		headTracker.EXPECT().LatestSafeBlock(mock.Anything).Return(finalized, nil).Once()
+		ec := clienttest.NewClient(t)
+		ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, number *big.Int) (*evmtypes.Head, error) {
+			return newHead(number.Int64()), nil
+		})
+		ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return([]types.Log{{BlockNumber: 5, BlockHash: common.HexToHash("0x123")}}, nil).Once()
+		mockBatchCallContext(t, ec)
+		lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+		lp.PollAndSaveLogs(t.Context(), 4, false)
+		require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated)
+	})
+	t.Run("Happy path", func(t *testing.T) {
+		lggr, _ := logger.TestObserved(t, zapcore.ErrorLevel)
+		chainID := testutils.NewRandomEVMChainID()
+		orm := NewORM(chainID, db, lggr)
+		headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+		finalized := newHead(5)
+		latest := newHead(16)
+		headTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latest, finalized, nil).Once()
+		headTracker.EXPECT().LatestSafeBlock(mock.Anything).Return(finalized, nil).Once()
+		ec := clienttest.NewClient(t)
+		ec.EXPECT().ConfiguredChainID().Return(chainID)
+		ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, number *big.Int) (*evmtypes.Head, error) {
+			return newHead(number.Int64()), nil
+		})
+		ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return([]types.Log{{BlockNumber: 5, BlockHash: common.BigToHash(big.NewInt(5)), Topics: []common.Hash{{}}}}, nil).Once()
+		mockBatchCallContext(t, ec)
+		lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+		lp.PollAndSaveLogs(t.Context(), 4, false)
+		require.NoError(t, lp.HealthReport()[lp.Name()])
+	})
+}
+
+type mockedLP struct {
+	ORM         *MockORM
+	Client      *clienttest.Client
+	HeadTracker *headstest.Tracker[*evmtypes.Head, common.Hash]
+	LP          *logPoller
+}
+
+func newMockedLP(t *testing.T, opts Opts) *mockedLP {
+	t.Helper()
+	mORM := NewMockORM(t)
+	ht := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+	ec := clienttest.NewClient(t)
+	return &mockedLP{
+		ORM:         mORM,
+		Client:      ec,
+		HeadTracker: ht,
+		LP:          NewLogPoller(mORM, ec, logger.Test(t), ht, opts),
+	}
+}
+
+// Test_getUnfinalizedLogs_includes_empty_finalized_when_skip_empty ensures the finalized
+// block is still present in the returned block slice when SkipEmptyBlocks is on and that
+// block has no logs. Without that, only the trailing block from the defer would be kept,
+// and the finalized checkpoint block would be missing from the middle of the range.
+func Test_getUnfinalizedLogs_includes_empty_finalized_when_skip_empty(t *testing.T) {
+	t.Parallel()
+
+	const (
+		latestBlock    int64 = 12
+		finalizedBlock int64 = 10
+		startBlock           = finalizedBlock - 1
+	)
+
+	opts := Opts{
+		PollPeriod:        time.Hour,
+		FinalityDepth:     2,
+		BackfillBatchSize: 10,
+		RPCBatchSize:      10,
+		SkipEmptyBlocks:   true,
+	}
+	m := newMockedLP(t, opts)
+
+	chainID := testutils.NewRandomEVMChainID()
+	filterCalls := int(latestBlock-startBlock) + 1
+	m.Client.EXPECT().ConfiguredChainID().Return(chainID).Times(filterCalls)
+
+	m.Client.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+		return newHead(n.Int64()), nil
+	}).Times(int(latestBlock - startBlock))
+
+	m.Client.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return(nil, nil).Times(filterCalls)
+
+	blocks, logs, err := m.LP.getUnfinalizedLogs(t.Context(), newHead(startBlock), latestBlock, latestBlock, finalizedBlock, false)
+	require.NoError(t, err)
+	require.Empty(t, logs)
+
+	assertContains := func(t *testing.T, blocks []Block, expected int64) {
+		t.Helper()
+		for _, b := range blocks {
+			if b.BlockNumber == expected {
+				return
+			}
+		}
+		t.Fatalf("expected block number %d in blocks slice: %#v", expected, blocks)
+	}
+
+	assertContains(t, blocks, finalizedBlock)
+	assertContains(t, blocks, latestBlock)
+}
+
+// Test_PollAndSaveLogs_FinalityViolation_reorgedFinalizedEmpty covers the case where the first poll
+// persists an empty finalized checkpoint (SkipEmptyBlocks) and a later poll sees a new canonical chain
+// that replaces only the finalized tail (blocks through 9 still match). The reorg handler must surface
+// ErrFinalityViolated instead of silently truncating past finality.
+func Test_PollAndSaveLogs_FinalityViolation_reorgedFinalizedEmpty(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	db := testutils.NewSqlxDB(t)
+	chainID := testutils.NewRandomEVMChainID()
+	lggr := logger.Test(t)
+	orm := NewORM(chainID, db, lggr)
+	ht := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+	ec := clienttest.NewClient(t)
+
+	const finalizedNum int64 = 10
+	const latestBlock int64 = 12
+
+	forkChain := make(map[int64]*evmtypes.Head)
+	for n := int64(1); n < finalizedNum; n++ {
+		forkChain[n] = newHead(n)
+	}
+	finalizedReorgHash := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000badf00d")
+	forkChain[finalizedNum] = &evmtypes.Head{
+		Number:     finalizedNum,
+		Hash:       finalizedReorgHash,
+		ParentHash: hashOf(finalizedNum - 1),
+		Timestamp:  time.Unix(finalizedNum, 0),
+	}
+	for n := finalizedNum + 1; n <= 20; n++ {
+		p := forkChain[n-1]
+		forkChain[n] = &evmtypes.Head{
+			Number:     n,
+			Hash:       common.BigToHash(big.NewInt(700000 + n)),
+			ParentHash: p.Hash,
+			Timestamp:  time.Unix(n, 0),
+		}
+	}
+
+	var onForkChain atomic.Bool
+	ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+		num := n.Int64()
+		if onForkChain.Load() {
+			h := forkChain[num]
+			require.NotNil(t, h, "missing fork head for %d", num)
+			return h, nil
+		}
+		return newHead(num), nil
+	})
+
+	// called during backfill only on initial poll
+	ec.On("BatchCallContext", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		elems := args.Get(1).([]rpc.BatchElem)
+		for i, e := range elems {
+			var num int64
+			block := e.Args[0].(string)
+			switch block {
+			case "latest":
+				num = latestBlock
+			case "finalized":
+				num = finalizedNum
+			default:
+				n, err := hexutil.DecodeUint64(block)
+				require.NoError(t, err)
+				if n <= math.MaxInt64 {
+					num = int64(n)
+				}
+				if num == 0 {
+					elems[i].Error = errors.New("block 0 is not available")
+					continue
+				}
+			}
+			result := e.Result.(*evmtypes.Head)
+			*result = newHeadVal(num)
+		}
+	})
+
+	// One backfill FilterLogs for [1,9] plus one unfinalized query per block 10..12.
+	ec.EXPECT().ConfiguredChainID().Return(chainID).Times(4)
+	ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return(nil, nil).Times(4)
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		FinalityDepth:            3,
+		BackfillBatchSize:        10,
+		RPCBatchSize:             10,
+		KeepFinalizedBlocksDepth: 50,
+		BackupPollerBlockDelay:   0,
+		SkipEmptyBlocks:          true,
+	}
+	lp := NewLogPoller(orm, ec, lggr, ht, lpOpts)
+
+	finalizedA := newHead(finalizedNum)
+	latestA := newHead(latestBlock)
+	ht.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latestA, finalizedA, nil).Once()
+	ht.EXPECT().LatestSafeBlock(mock.Anything).Return(finalizedA, nil).Once()
+
+	lp.PollAndSaveLogs(ctx, 1, false)
+	require.NoError(t, lp.HealthReport()[lp.Name()])
+
+	onForkChain.Store(true)
+	latestB := forkChain[latestBlock+1]
+	finalizedB := forkChain[finalizedNum]
+	ht.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latestB, finalizedB, nil).Once()
+	ht.EXPECT().LatestSafeBlock(mock.Anything).Return(finalizedB, nil).Once()
+
+	lp.PollAndSaveLogs(ctx, latestBlock+1, false)
+	require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated)
+}
+
+// Test_PollAndSaveLogs_FinalityViolation_replayMissingSkippedEmptyParent - documents a scenario where DB stores sparse chain.
+// Block 100 is present in DB and marked finalized, but its parent 99 was empty and thus not stored.
+// A later reorg occurred at block 99.
+// A replay is triggered at the finalized height 100, which must surface finality violation instead of silently accepting the new chain with a different block 100 that descends from 99.
+func Test_PollAndSaveLogs_FinalityViolation_replayMissingSkippedEmptyParent(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	db := testutils.NewSqlxDB(t)
+	chainID := testutils.NewRandomEVMChainID()
+	lggr := logger.Test(t)
+	orm := NewORM(chainID, db, lggr)
+	ht := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+	ec := clienttest.NewClient(t)
+
+	const (
+		forkedAt     = int64(99)
+		finalizedNum = int64(100)
+		latestNum    = int64(102)
+	)
+
+	newHash := func(n int64) common.Hash {
+		if n >= forkedAt {
+			return hashOf(n + 9_000_000) // ensure different hashes on fork
+		}
+		return hashOf(n)
+	}
+
+	newHeadWithFork := func(n int64) evmtypes.Head {
+		return evmtypes.Head{
+			Number:     n,
+			Hash:       newHash(n),
+			ParentHash: newHash(n - 1),
+			EVMChainID: sqlutil.New(chainID),
+		}
+	}
+
+	ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+		num := latestNum
+		if n != nil {
+			num = n.Int64()
+		}
+
+		result := newHeadWithFork(num)
+		return &result, nil
+	}).Maybe()
+
+	addr := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	ec.EXPECT().CodeAt(mock.Anything, addr, (*big.Int)(nil)).Return([]byte{0x60, 0x80, 0x60, 0x40, 0x52}, nil).Once()
+	ec.EXPECT().ConfiguredChainID().Return(chainID).Maybe()
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		FinalityDepth:            2,
+		BackfillBatchSize:        10,
+		RPCBatchSize:             10,
+		KeepFinalizedBlocksDepth: 1000,
+		BackupPollerBlockDelay:   0,
+		SkipEmptyBlocks:          true,
+		UseFinalityTag:           false,
+	}
+	lp := NewLogPoller(orm, ec, lggr, ht, lpOpts)
+
+	require.NoError(t, lp.RegisterFilter(ctx, Filter{
+		Name:      "emitter",
+		EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+		Addresses: []common.Address{addr},
+	}))
+
+	ts := func(n int64) time.Time { return time.Unix(n, 0) }
+
+	// setup DB state:
+	// 98	canonical, unchanged by the reorg
+	// 99 was empty, so not present in DB
+	// 100 was persisted as checkpoint. Is finalized at T1; reorged as a descendant of H=99
+	// 102 has FinalizedBlockNumber=100 reorged as a descendant of H=99
+
+	b98 := Block{
+		EVMChainID:           sqlutil.New(chainID),
+		BlockHash:            hashOf(98),
+		BlockNumber:          98,
+		BlockTimestamp:       ts(98),
+		FinalizedBlockNumber: finalizedNum,
+		SafeBlockNumber:      finalizedNum,
+	}
+
+	b100 := Block{
+		EVMChainID:           sqlutil.New(chainID),
+		BlockHash:            hashOf(100),
+		BlockNumber:          100,
+		BlockTimestamp:       ts(100),
+		FinalizedBlockNumber: finalizedNum,
+		SafeBlockNumber:      finalizedNum,
+	}
+
+	b102 := Block{
+		EVMChainID:           sqlutil.New(chainID),
+		BlockHash:            hashOf(102),
+		BlockNumber:          102,
+		BlockTimestamp:       ts(102),
+		FinalizedBlockNumber: finalizedNum,
+		SafeBlockNumber:      finalizedNum,
+	}
+
+	require.NoError(t, orm.InsertBlocks(ctx, []Block{b98, b100, b102}))
+
+	latestH := newHeadWithFork(latestNum + 2)
+	finalizedH := newHeadWithFork(finalizedNum)
+	ht.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(&latestH, &finalizedH, nil).Maybe()
+	ht.EXPECT().LatestSafeBlock(mock.Anything).Return(&finalizedH, nil).Maybe()
+
+	lp.PollAndSaveLogs(ctx, finalizedNum, true)
+
+	require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated,
+		"reorg that changes a previously finalized checkpoint must not be treated as an ordinary rewind")
+}
+
+// Test_PollAndSaveLogs_FinalityViolationSurvivesTransient documents that
+// PollAndSaveLogs only clears finalityViolated after a successful verification that DB's latest block belongs to the canonical chain.
+func Test_PollAndSaveLogs_FinalityViolationSurvivesTransient(t *testing.T) {
+	t.Parallel()
+
+	chainID := testutils.NewRandomEVMChainID()
+	opts := Opts{PollPeriod: time.Hour, FinalityDepth: 2, BackfillBatchSize: 10, RPCBatchSize: 10}
+
+	assertFinalityViolated := func(t *testing.T, lp *logPoller) {
+		t.Helper()
+		require.ErrorIs(t, lp.HealthReport()[lp.Name()], commontypes.ErrFinalityViolated)
+	}
+
+	dbBlock := func(n int64) *Block {
+		h := hashOf(n)
+		return &Block{
+			BlockHash:            h,
+			BlockNumber:          n,
+			BlockTimestamp:       time.Unix(n, 0),
+			FinalizedBlockNumber: n,
+			SafeBlockNumber:      n,
+		}
+	}
+
+	expectLatestSafe := func(ht *headstest.Tracker[*evmtypes.Head, common.Hash], latestNum, finalizedNum int64) {
+		latest := newHead(latestNum)
+		finalized := newHead(finalizedNum)
+		ht.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latest, finalized, nil).Once()
+		ht.EXPECT().LatestSafeBlock(mock.Anything).Return(finalized, nil).Once()
+	}
+
+	t.Run("LatestAndFinalizedBlock returns error", func(t *testing.T) {
+		m := newMockedLP(t, opts)
+		m.HeadTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(nil, nil, errors.New("temporary failure fetching latest block")).Once()
+		m.LP.finalityViolated.Store(true)
+		m.LP.PollAndSaveLogs(t.Context(), 1, false)
+		assertFinalityViolated(t, m.LP)
+	})
+
+	t.Run("LatestSafeBlock returns error", func(t *testing.T) {
+		m := newMockedLP(t, opts)
+		finalized := newHead(5)
+		latest := newHead(16)
+		m.HeadTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).Return(latest, finalized, nil).Once()
+		m.HeadTracker.EXPECT().LatestSafeBlock(mock.Anything).Return(nil, errors.New("temporary failure fetching safe block")).Once()
+		m.LP.finalityViolated.Store(true)
+		m.LP.PollAndSaveLogs(t.Context(), 1, false)
+		assertFinalityViolated(t, m.LP)
+	})
+
+	t.Run("latest block number lower than current", func(t *testing.T) {
+		m := newMockedLP(t, opts)
+		expectLatestSafe(m.HeadTracker, 3, 1)
+		m.LP.finalityViolated.Store(true)
+		m.LP.PollAndSaveLogs(t.Context(), 10, false)
+		assertFinalityViolated(t, m.LP)
+	})
+
+	t.Run("getCurrentBlockMaybeHandleReorg fails", func(t *testing.T) {
+		m := newMockedLP(t, opts)
+		// headerByNumber runs before any ORM read when currentBlock is nil.
+		expectLatestSafe(m.HeadTracker, 10, 8)
+		m.Client.EXPECT().HeadByNumber(mock.Anything, mock.MatchedBy(func(n *big.Int) bool { return n.Int64() == 5 })).
+			Return(nil, errors.New("rpc head by number failed")).Once()
+		m.LP.finalityViolated.Store(true)
+		m.LP.PollAndSaveLogs(t.Context(), 5, false)
+		assertFinalityViolated(t, m.LP)
+	})
+
+	t.Run("happy path clears finality violation", func(t *testing.T) {
+		m := newMockedLP(t, opts)
+		m.ORM.EXPECT().SelectBlockByNumber(mock.Anything, int64(9)).Return(dbBlock(9), nil).Once()
+		m.ORM.EXPECT().InsertLogsWithBlocks(mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+		expectLatestSafe(m.HeadTracker, 10, 8)
+		m.Client.EXPECT().ConfiguredChainID().Return(chainID).Maybe()
+		m.Client.EXPECT().FilterLogs(mock.Anything, mock.Anything).Return([]types.Log{{
+			BlockNumber: 10,
+			BlockHash:   hashOf(10),
+			Topics:      []common.Hash{common.HexToHash("0x100")},
+		}}, nil).Once()
+		m.LP.finalityViolated.Store(true)
+		m.LP.PollAndSaveLogs(t.Context(), 10, false)
+		require.NoError(t, m.LP.HealthReport()[m.LP.Name()])
+	})
+}
+
+func Test_FindBlockAfterLCA(t *testing.T) {
+	testCases := []struct {
+		Name            string
+		SkipEmptyBlocks bool
+	}{
+		{
+			Name:            "Skip empty block",
+			SkipEmptyBlocks: true,
+		},
+		{
+			Name:            "Don't skip empty block",
+			SkipEmptyBlocks: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			lpOpts := Opts{
+				PollPeriod:               time.Second,
+				FinalityDepth:            3,
+				BackfillBatchSize:        3,
+				RPCBatchSize:             3,
+				KeepFinalizedBlocksDepth: 20,
+				BackupPollerBlockDelay:   0,
+				SkipEmptyBlocks:          tc.SkipEmptyBlocks,
+			}
+			testFindBlockAfterLCA(t, lpOpts)
+		})
+	}
+}
+
+func testFindBlockAfterLCA(t *testing.T, opts Opts) {
+	testCases := []struct {
+		Name               string
+		CurrentBlockNumber int64
+		DBLatestFinalized  int64
+		DBBlocks           []int64
+		Setup              func(t *testing.T, ec *clienttest.Client)
+		ExpectedError      error
+		ExpectedHead       *evmtypes.Head
+	}{
+		{
+			Name:               "current head lower than DB finalized",
+			CurrentBlockNumber: 3,
+			DBLatestFinalized:  5,
+			DBBlocks:           nil,
+			Setup:              nil,
+			ExpectedError:      commontypes.ErrFinalityViolated,
+			ExpectedHead:       nil,
+		},
+		{
+			Name:               "current head is equal to DB finalized", // still finality violation as hash mismatch occurred for finalized block
+			CurrentBlockNumber: 5,
+			DBLatestFinalized:  5,
+			DBBlocks:           nil,
+			Setup:              nil,
+			ExpectedError:      commontypes.ErrFinalityViolated,
+			ExpectedHead:       nil,
+		},
+		{
+			Name:               "no reorg - chains match on first iteration",
+			CurrentBlockNumber: 5,
+			DBLatestFinalized:  3,
+			DBBlocks:           []int64{4},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					return newHead(n.Int64()), nil
+				})
+			},
+			ExpectedError: nil,
+			ExpectedHead:  newHead(5),
+		},
+		{
+			Name:               "reorg - LCA found after walking back",
+			CurrentBlockNumber: 5,
+			DBLatestFinalized:  1,
+			DBBlocks:           []int64{2, 3},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					num := n.Int64()
+					if num == 4 {
+						return &evmtypes.Head{Number: 4, Hash: common.BigToHash(big.NewInt(4)), ParentHash: common.HexToHash("0xdead")}, nil
+					}
+					return newHead(num), nil
+				}).Maybe()
+			},
+			ExpectedError: nil,
+			ExpectedHead:  newHead(3),
+		},
+		{
+			Name:               "reorg too deep",
+			CurrentBlockNumber: 5,
+			DBLatestFinalized:  2,
+			DBBlocks:           []int64{1},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					num := n.Int64()
+					return &evmtypes.Head{Number: num, Hash: common.BigToHash(big.NewInt(num)), ParentHash: common.HexToHash("0xbeef")}, nil
+				})
+			},
+			ExpectedError: commontypes.ErrFinalityViolated,
+			ExpectedHead:  nil,
+		},
+		{
+			Name:               "RPC HeadByNumber returns error",
+			CurrentBlockNumber: 5,
+			DBLatestFinalized:  3,
+			DBBlocks:           []int64{4},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					if n.Int64() == 5 {
+						return nil, errors.New("rpc error")
+					}
+					return newHead(n.Int64()), nil
+				})
+			},
+			ExpectedError: errors.New("rpc error"),
+			ExpectedHead:  nil,
+		},
+		{
+			Name:               "All blocks in DB are on a different chain",
+			CurrentBlockNumber: 100,
+			DBLatestFinalized:  10,
+			DBBlocks:           []int64{90, 80, 55, 20},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					head := newHead(n.Int64())
+					if n.Int64() < 20 {
+						return head, nil
+					}
+					head.ParentHash = common.HexToHash("0xdead")
+					head.Hash = common.HexToHash("0xdead")
+					return head, nil
+				})
+			},
+			ExpectedError: nil,
+			ExpectedHead: &evmtypes.Head{
+				Number:     20,
+				Hash:       common.HexToHash("0xdead"),
+				ParentHash: common.HexToHash("0xdead"),
+			},
+		},
+		{
+			Name:               "Sparse DB blocks - LCA found successfully",
+			CurrentBlockNumber: 100,
+			DBLatestFinalized:  10,
+			DBBlocks:           []int64{90, 80, 55, 20},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					head := newHead(n.Int64())
+					if n.Int64() > 21 {
+						head.ParentHash = common.HexToHash("0xdead")
+						return head, nil
+					}
+					return head, nil
+				})
+			},
+			ExpectedError: nil,
+			ExpectedHead:  newHead(21),
+		},
+		{
+			Name:               "Child of latest finalized is not canonical - finality violation",
+			CurrentBlockNumber: 100,
+			DBLatestFinalized:  80,
+			DBBlocks:           []int64{90, 80, 55, 20},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					head := newHead(n.Int64())
+					if n.Int64() > 80 {
+						head.ParentHash = common.HexToHash("0xdead")
+						return head, nil
+					}
+					return head, nil
+				})
+			},
+			ExpectedError: commontypes.ErrFinalityViolated,
+			ExpectedHead:  nil,
+		},
+		{
+			// Such case is possible, since DBLatestFinalized is defined by FinalizedBlockNumber of the latest block.
+			Name:               "Latest finalized DB block is in canonical but much older than DBLatestFinalized",
+			CurrentBlockNumber: 100,
+			DBLatestFinalized:  80,
+			DBBlocks:           []int64{90, 70, 55, 20},
+			Setup: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, n *big.Int) (*evmtypes.Head, error) {
+					head := newHead(n.Int64())
+					if n.Int64() > 80 {
+						head.ParentHash = common.HexToHash("0xdead")
+						return head, nil
+					}
+					return head, nil
+				})
+			},
+			ExpectedError: nil,
+			ExpectedHead:  newHead(71),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			db := testutils.NewSqlxDB(t)
+			lggr, _ := logger.TestObserved(t, zapcore.DebugLevel)
+			orm := NewORM(testutils.NewRandomEVMChainID(), db, lggr)
+			headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+			ec := clienttest.NewClient(t)
+			ctx := t.Context()
+			for _, blockNum := range tc.DBBlocks {
+				hash := common.BigToHash(big.NewInt(blockNum))
+				require.NoError(t, orm.InsertBlock(ctx, hash, blockNum, time.Now(), blockNum, blockNum))
+			}
+			if tc.Setup != nil {
+				tc.Setup(t, ec)
+			}
+			lp := NewLogPoller(orm, ec, lggr, headTracker, opts)
+			blockAfterLCA, err := lp.findBlockAfterLCA(ctx, tc.CurrentBlockNumber, tc.DBLatestFinalized)
+			if tc.ExpectedError != nil {
+				require.ErrorContains(t, err, tc.ExpectedError.Error())
+				require.Nil(t, blockAfterLCA)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.ExpectedHead, blockAfterLCA)
+			}
+		})
+	}
+}
+
+func TestLogPoller_getCurrentBlockMaybeHandleReorg(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	chainID := testutils.NewRandomEVMChainID()
+
+	newBlock := func(blockNumber int64) *Block {
+		return &Block{
+			BlockNumber: blockNumber,
+			BlockHash:   hashOf(blockNumber),
+		}
+	}
+
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		KeepFinalizedBlocksDepth: 1000,
+	}
+
+	testCases := []struct {
+		name            string
+		currentBlockNum int64
+		currentBlock    *evmtypes.Head
+		isReplay        bool
+		setupORM        func(t *testing.T, m *MockORM)
+		setupEC         func(t *testing.T, ec *clienttest.Client)
+		wantErr         string
+		wantHead        *evmtypes.Head
+	}{
+		{
+			name:            "nil currentBlock propagates headerByNumber RPC error",
+			currentBlockNum: 4,
+			currentBlock:    nil,
+			isReplay:        false,
+			setupORM:        nil,
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(4)).
+					Return(nil, errors.New("rpc down")).Once()
+			},
+			wantErr: "rpc down",
+		},
+		{
+			name:            "nil currentBlock rejects nil header from RPC",
+			currentBlockNum: 4,
+			currentBlock:    nil,
+			isReplay:        false,
+			setupORM:        nil,
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(4)).
+					Return(nil, nil).Once()
+			},
+			wantErr: "got nil block",
+		},
+		{
+			name:            "nil currentBlock rejects wrong block number from RPC",
+			currentBlockNum: 4,
+			currentBlock:    nil,
+			isReplay:        false,
+			setupORM:        nil,
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				wrong := newHead(3)
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(4)).
+					Return(wrong, nil).Once()
+			},
+			wantErr: "block mismatch",
+		},
+		{
+			name:            "normal poll returns when parent block matches DB",
+			currentBlockNum: 10,
+			currentBlock:    newHead(10),
+			isReplay:        false,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(9)).Return(newBlock(9), nil).Once()
+			},
+			setupEC:  func(t *testing.T, ec *clienttest.Client) {},
+			wantHead: newHead(10),
+		},
+		{
+			name:            "first poll on empty DB without replay",
+			currentBlockNum: 1,
+			currentBlock:    newHead(1),
+			isReplay:        false,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(0)).Return(nil, sql.ErrNoRows).Once()
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(nil, sql.ErrNoRows).Once()
+			},
+			setupEC:  func(t *testing.T, ec *clienttest.Client) {},
+			wantHead: newHead(1),
+		},
+		{
+			name:            "invariant when previous block missing but DB is not empty",
+			currentBlockNum: 10,
+			currentBlock:    newHead(10),
+			isReplay:        false,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(9)).Return(nil, sql.ErrNoRows).Once()
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(newBlock(5), nil).Once()
+			},
+			setupEC: func(t *testing.T, ec *clienttest.Client) {},
+			wantErr: "unexpected state: no previous block found",
+		},
+		{
+			name:            "parent mismatch triggers reorg and returns canonical child block",
+			currentBlockNum: 2,
+			currentBlock: &evmtypes.Head{
+				Number:     2,
+				Hash:       hashOf(2),
+				ParentHash: common.HexToHash("0xdead"),
+				Timestamp:  time.Unix(2, 0),
+			},
+			isReplay: false,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(1)).Return(newBlock(1), nil).Once()
+				// setup for reorg handling
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(newBlock(1), nil).Once()
+				m.EXPECT().SelectNewestBlock(mock.Anything, int64(1)).Return(newBlock(1), nil).Once()
+				m.EXPECT().DeleteLogsAndBlocksAfter(mock.Anything, int64(2)).Return(nil).Once()
+			},
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(2)).
+					Return(newHead(2), nil).Once()
+			},
+			wantHead: newHead(2),
+		},
+		{
+			name:            "replay happy path",
+			currentBlockNum: 5,
+			currentBlock:    newHead(5),
+			isReplay:        true,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(4)).Return(newBlock(4), nil).Once()
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(5)).Return(newBlock(5), nil).Once()
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(newBlock(5), nil).Once()
+			},
+			setupEC:  func(t *testing.T, ec *clienttest.Client) {},
+			wantHead: newHead(5),
+		},
+		{
+			name:            "replay mid-chain compares latest RPC header to DB",
+			currentBlockNum: 3,
+			currentBlock:    newHead(3),
+			isReplay:        true,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(2)).Return(newBlock(2), nil).Once()
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(3)).Return(newBlock(3), nil).Once()
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(newBlock(5), nil).Once()
+			},
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(5)).
+					Return(newHead(5), nil).Once()
+			},
+			wantHead: newHead(3),
+		},
+		{
+			name:            "replay detects current block hash mismatch vs DB",
+			currentBlockNum: 3,
+			currentBlock:    newHead(3),
+			isReplay:        true,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(2)).Return(newBlock(2), nil).Once()
+				deadBlock := &Block{BlockNumber: 3, BlockHash: common.HexToHash("0xdead")}
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(3)).Return(deadBlock, nil).Once()
+				// reorg handling setup
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(deadBlock, nil).Once()
+				m.EXPECT().SelectNewestBlock(mock.Anything, int64(2)).Return(newBlock(2), nil).Once()
+				// delete is inclusive, so [3, latest] should be deleted
+				m.EXPECT().DeleteLogsAndBlocksAfter(mock.Anything, int64(3)).Return(nil).Once()
+			},
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(3)).
+					Return(newHead(3), nil).Once()
+			},
+			wantHead: newHead(3),
+		},
+		{
+			name:            "replay detects latest block hash mismatch vs DB",
+			currentBlockNum: 3,
+			currentBlock:    newHead(3),
+			isReplay:        true,
+			setupORM: func(t *testing.T, m *MockORM) {
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(2)).Return(nil, sql.ErrNoRows).Once()
+				m.EXPECT().SelectBlockByNumber(mock.Anything, int64(3)).Return(newBlock(3), nil).Once()
+				deadBlock := &Block{BlockNumber: 5, BlockHash: common.HexToHash("0xdead")}
+				m.EXPECT().SelectLatestBlock(mock.Anything).Return(deadBlock, nil).Times(2)
+				m.EXPECT().SelectNewestBlock(mock.Anything, int64(4)).Return(newBlock(4), nil).Once()
+				m.EXPECT().DeleteLogsAndBlocksAfter(mock.Anything, int64(5)).Return(nil).Once()
+			},
+			setupEC: func(t *testing.T, ec *clienttest.Client) {
+				ec.EXPECT().HeadByNumber(mock.Anything, big.NewInt(5)).
+					RunAndReturn(func(_ context.Context, num *big.Int) (*evmtypes.Head, error) {
+						return newHead(num.Int64()), nil
+					}).Times(2)
+			},
+			wantHead: newHead(3),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			lggr := logger.Test(t)
+			orm := NewMockORM(t)
+			if tc.setupORM != nil {
+				tc.setupORM(t, orm)
+			}
+			ec := clienttest.NewClient(t)
+			ec.EXPECT().ConfiguredChainID().Return(chainID).Maybe()
+			if tc.setupEC != nil {
+				tc.setupEC(t, ec)
+			}
+
+			lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+			got, err := lp.getCurrentBlockMaybeHandleReorg(ctx, tc.currentBlockNum, tc.currentBlock, tc.isReplay)
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantErr)
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Equal(t, tc.wantHead.Number, got.Number)
+			require.Equal(t, tc.wantHead.Hash, got.Hash)
+			require.Equal(t, tc.wantHead.ParentHash, got.ParentHash)
+		})
+	}
+}
+
+// TestLogPoller_ReplayAfterReorg - covers the scenario when replay is triggered after a reorg, and the reorg includes blocks that are not present in DB (e.g. because they were empty and SkipEmptyBlocks is true).
+// LogPoller should be able to replay logs and DB's state should be consistent with the chain's state after the reorg.
+func TestLogPoller_ReplayAfterReorg(t *testing.T) {
+	t.Parallel()
+
+	const (
+		finalityDepth int64 = 20
+		logBlock      int64 = 16
+		reorgFrom     int64 = 18
+	)
+
+	addr := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(t)
+	lggr := logger.Test(t)
+	orm := NewORM(chainID, db, lggr)
+
+	var reorg atomic.Bool
+
+	blockHash := func(n int64) common.Hash {
+		if reorg.Load() && n >= reorgFrom {
+			return common.BigToHash(big.NewInt(n + 10_000))
+		}
+		return common.BigToHash(big.NewInt(n))
+	}
+	parentHash := func(n int64) common.Hash {
+		if n <= 1 {
+			return common.BigToHash(big.NewInt(0))
+		}
+		return blockHash(n - 1)
+	}
+	makeHead := func(n int64) *evmtypes.Head {
+		h := evmtypes.Head{
+			Number:     n,
+			Hash:       blockHash(n),
+			ParentHash: parentHash(n),
+			Timestamp:  time.Unix(n, 0),
+			EVMChainID: sqlutil.New(chainID),
+		}
+		return &h
+	}
+
+	var latestNum int64 = 20
+
+	headTracker := headstest.NewTracker[*evmtypes.Head, common.Hash](t)
+	headTracker.EXPECT().LatestAndFinalizedBlock(mock.Anything).RunAndReturn(func(ctx context.Context) (*evmtypes.Head, *evmtypes.Head, error) {
+		return makeHead(latestNum), makeHead(max(latestNum-finalityDepth, 0)), nil
+	}).Maybe()
+	headTracker.EXPECT().LatestSafeBlock(mock.Anything).RunAndReturn(func(ctx context.Context) (*evmtypes.Head, error) {
+		return makeHead(max(latestNum-finalityDepth, 0)), nil
+	}).Maybe()
+
+	ec := clienttest.NewClient(t)
+	ec.EXPECT().ConfiguredChainID().Return(chainID).Maybe()
+	ec.EXPECT().CodeAt(mock.Anything, addr, (*big.Int)(nil)).Return([]byte{0x60, 0x80, 0x60, 0x40, 0x52}, nil).Once()
+
+	ec.EXPECT().HeadByNumber(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, n *big.Int) (*evmtypes.Head, error) {
+		if n == nil {
+			return makeHead(latestNum), nil
+		}
+		return makeHead(n.Int64()), nil
+	}).Maybe()
+
+	logs := map[common.Hash][]types.Log{
+		blockHash(logBlock): {
+			types.Log{
+				Index:       0,
+				BlockNumber: uint64(logBlock),
+				BlockHash:   blockHash(logBlock),
+				TxHash:      common.HexToHash("0xabc123"),
+				Topics:      []common.Hash{EmitterABI.Events["Log1"].ID},
+				Address:     addr,
+				Data:        common.LeftPadBytes([]byte{0x42}, 32),
+			},
+		},
+	}
+
+	ec.EXPECT().FilterLogs(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+		if q.BlockHash == nil {
+			panic("expected block hash to be used")
+		}
+
+		return logs[*q.BlockHash], nil
+	}).Maybe()
+
+	lpOpts := Opts{
+		PollPeriod:               24 * time.Hour, // extra large period, so that we can drive PollAndSaveLogs manually without it racing with the background loop
+		FinalityDepth:            finalityDepth,
+		RPCBatchSize:             25,
+		KeepFinalizedBlocksDepth: 1000,
+		BackupPollerBlockDelay:   0,
+		SkipEmptyBlocks:          true,
+	}
+	lp := NewLogPoller(orm, ec, lggr, headTracker, lpOpts)
+
+	ctx := t.Context()
+	require.NoError(t, lp.RegisterFilter(ctx, Filter{
+		Name:      "emitter",
+		EventSigs: []common.Hash{EmitterABI.Events["Log1"].ID},
+		Addresses: []common.Address{addr},
+	}))
+
+	servicetest.Run(t, lp)
+
+	lp.PollAndSaveLogs(ctx, 1, false)
+
+	// block 16 is in DB as it has logs
+	// block 20 is in DB as it is the latest - used as a checkpoint
+	for _, n := range []int64{16, 20} {
+		b, err := orm.SelectBlockByNumber(ctx, n)
+		require.NoError(t, err)
+		require.NotNil(t, b)
+		require.Equal(t, b.BlockNumber, n)
+	}
+
+	for _, n := range []int64{17, 18, 19} {
+		_, err := orm.SelectBlockByNumber(ctx, n)
+		require.ErrorIs(t, err, sql.ErrNoRows)
+	}
+
+	// Start replay after a reorg from a block whose parent does not exist in DB.
+	// But chain experienced a reorg at block 18, and latest block decreased from 20 to 19
+	latestNum = 19
+	reorg.Store(true)
+	require.NoError(t, lp.Replay(ctx, 18))
+
+	// after reorg is handled - block 20 must be gone, block 19 must be in DB with new hash
+	_, err := orm.SelectBlockByNumber(ctx, 20)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	db19AfterReorg, err := orm.SelectBlockByNumber(ctx, 19)
+	require.NoError(t, err)
+	require.Equal(t, common.BigToHash(big.NewInt(19+10_000)), db19AfterReorg.BlockHash)
+
+	// latest block must be updated to 19, and logs for block 16 must still be there
+	latestSaved, err := orm.SelectLatestBlock(ctx)
+	require.NoError(t, err)
+	require.Equal(t, latestNum, latestSaved.BlockNumber)
+
+	dbLogs, err := orm.SelectLogsByBlockRange(ctx, 0, latestNum)
+	require.NoError(t, err)
+	require.Len(t, dbLogs, 1)
+}
+
+func benchmarkFilter(b *testing.B, nFilters, nAddresses, nEvents int) {
+	lggr := logger.Test(b)
+	lpOpts := Opts{
+		PollPeriod:               time.Hour,
+		FinalityDepth:            2,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 1000,
+	}
+	chainID := testutils.NewRandomEVMChainID()
+	db := testutils.NewSqlxDB(b)
+	orm := NewORM(chainID, db, lggr)
+	ec := clienttest.NewClient(b)
+	contractCode := []byte{0x60, 0x80, 0x60, 0x40, 0x52}
+	ec.On("CodeAt", mock.Anything, mock.Anything, (*big.Int)(nil)).Return(contractCode, nil).Maybe()
+	lp := NewLogPoller(orm, ec, lggr, nil, lpOpts)
+	for range nFilters {
+		var addresses []common.Address
+		var events []common.Hash
+		for j := range nAddresses {
+			addresses = append(addresses, common.BigToAddress(big.NewInt(int64(j+1))))
+		}
+		for j := range nEvents {
+			events = append(events, common.BigToHash(big.NewInt(int64(j+1))))
+		}
+		err := lp.RegisterFilter(b.Context(), Filter{Name: "my Filter", EventSigs: events, Addresses: addresses})
+		require.NoError(b, err)
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		lp.Filter(nil, nil, nil)
+	}
+}
+
+func BenchmarkFilter10_1(b *testing.B) {
+	benchmarkFilter(b, 10, 1, 1)
+}
+func BenchmarkFilter100_10(b *testing.B) {
+	benchmarkFilter(b, 100, 10, 10)
+}
+func BenchmarkFilter1000_100(b *testing.B) {
+	benchmarkFilter(b, 1000, 100, 100)
+}
+
+func skipToBlockOpts() Opts {
+	return Opts{
+		UseFinalityTag:           false,
+		FinalityDepth:            2,
+		BackfillBatchSize:        3,
+		RPCBatchSize:             2,
+		KeepFinalizedBlocksDepth: 1000,
+		PollPeriod:               time.Hour,
+	}
+}
+
+func expectFinalizedAnchorHeader(t *testing.T, ec *clienttest.Client, anchorBlockNumber int64) {
+	t.Helper()
+	ec.EXPECT().HeaderByNumberWithOpts(
+		mock.Anything,
+		big.NewInt(anchorBlockNumber),
+		evmtypes.HeaderByNumberOpts{ConfidenceLevel: primitives.Finalized},
+	).RunAndReturn(func(_ context.Context, _ *big.Int, _ evmtypes.HeaderByNumberOpts) (*evmtypes.Header, error) {
+		head := newHead(anchorBlockNumber)
+		return (*evmtypes.Header)(head), nil
+	}).Once()
+}
+
+func expectStoreNewFinalizedCheckpoint(t *testing.T, orm *MockORM, anchorBlockNumber, minBlockToPrune int64) {
+	t.Helper()
+	orm.EXPECT().StoreNewFinalizedCheckpoint(
+		mock.Anything,
+		mock.MatchedBy(func(b Block) bool {
+			return b.BlockNumber == anchorBlockNumber &&
+				b.BlockHash == hashOf(anchorBlockNumber) &&
+				b.FinalizedBlockNumber == anchorBlockNumber &&
+				b.SafeBlockNumber == anchorBlockNumber
+		}),
+		minBlockToPrune,
+	).Return(nil).Once()
+}
+
+func Test_skipToBlock(t *testing.T) {
+	t.Parallel()
+
+	t.Run("invalid block number", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		err := m.LP.SkipToBlock(t.Context(), 1)
+		require.ErrorContains(t, err, "must be >= 2")
+	})
+
+	t.Run("disabled log poller returns error", func(t *testing.T) {
+		t.Parallel()
+		err := LogPollerDisabled.SkipToBlock(t.Context(), 2)
+		require.ErrorIs(t, err, ErrDisabled)
+	})
+
+	t.Run("RPC fetch error", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		m.Client.EXPECT().HeaderByNumberWithOpts(
+			mock.Anything,
+			big.NewInt(2),
+			evmtypes.HeaderByNumberOpts{ConfidenceLevel: primitives.Finalized},
+		).Return(nil, errors.New("rpc unavailable")).Once()
+
+		err := m.LP.SkipToBlock(t.Context(), 3)
+		require.ErrorContains(t, err, "failed to fetch anchor block 2 from RPC")
+		require.ErrorContains(t, err, "rpc unavailable")
+	})
+
+	t.Run("invalid anchor header", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		m.Client.EXPECT().HeaderByNumberWithOpts(
+			mock.Anything,
+			big.NewInt(2),
+			evmtypes.HeaderByNumberOpts{ConfidenceLevel: primitives.Finalized},
+		).RunAndReturn(func(_ context.Context, _ *big.Int, _ evmtypes.HeaderByNumberOpts) (*evmtypes.Header, error) {
+			head := newHeadVal(2)
+			head.Hash = common.Hash{}
+			return (*evmtypes.Header)(&head), nil
+		}).Once()
+
+		err := m.LP.SkipToBlock(t.Context(), 3)
+		require.ErrorContains(t, err, "failed to validate anchor block 2")
+	})
+
+	t.Run("forward skip on empty DB", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		expectFinalizedAnchorHeader(t, m.Client, 2)
+		m.ORM.EXPECT().SelectLatestBlock(mock.Anything).Return(nil, sql.ErrNoRows).Once()
+		expectStoreNewFinalizedCheckpoint(t, m.ORM, 2, 2)
+
+		require.NoError(t, m.LP.SkipToBlock(t.Context(), 3))
+		assert.Equal(t, int64(3), m.LP.backupPollerNextBlock)
+	})
+
+	t.Run("Happy path", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		expectFinalizedAnchorHeader(t, m.Client, 5)
+		m.ORM.EXPECT().SelectLatestBlock(mock.Anything).Return(&Block{
+			BlockNumber:          4,
+			FinalizedBlockNumber: 2,
+			SafeBlockNumber:      2,
+		}, nil).Once()
+		expectStoreNewFinalizedCheckpoint(t, m.ORM, 5, 3)
+
+		require.NoError(t, m.LP.SkipToBlock(t.Context(), 6))
+	})
+
+	t.Run("backward skip is not allowed", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		expectFinalizedAnchorHeader(t, m.Client, 2)
+		m.ORM.EXPECT().SelectLatestBlock(mock.Anything).Return(&Block{
+			BlockNumber:          4,
+			FinalizedBlockNumber: 3,
+			SafeBlockNumber:      3,
+		}, nil).Once()
+		require.ErrorContains(t, m.LP.SkipToBlock(t.Context(), 3), "skipping to a block 2 that is older than previously finalized 3 is not allowed. Use explicit remove-blocks to delete blocks")
+	})
+
+	t.Run("select latest block error", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		expectFinalizedAnchorHeader(t, m.Client, 2)
+		m.ORM.EXPECT().SelectLatestBlock(mock.Anything).Return(nil, errors.New("db unavailable")).Once()
+
+		err := m.LP.SkipToBlock(t.Context(), 3)
+		require.ErrorContains(t, err, "failed to select latest block")
+	})
+
+	t.Run("store checkpoint error", func(t *testing.T) {
+		t.Parallel()
+		m := newMockedLP(t, skipToBlockOpts())
+		expectFinalizedAnchorHeader(t, m.Client, 2)
+		m.ORM.EXPECT().SelectLatestBlock(mock.Anything).Return(nil, sql.ErrNoRows).Once()
+		m.ORM.EXPECT().StoreNewFinalizedCheckpoint(mock.Anything, mock.Anything, int64(2)).
+			Return(errors.New("db write failed")).Once()
+
+		err := m.LP.SkipToBlock(t.Context(), 3)
+		require.ErrorContains(t, err, "failed to store new finalized checkpoint")
+	})
+}

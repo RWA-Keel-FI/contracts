@@ -1,0 +1,436 @@
+package storage
+
+import (
+	"fmt"
+	"math/big"
+	"slices"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	evmtypes "github.com/ethereum/go-ethereum/core/types"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txm/types"
+	"github.com/smartcontractkit/chainlink-framework/chains/txmgr"
+)
+
+const (
+	// MaxAllowedAttempts controls the maximum number of attempts stored per transactions. After this threshold is exceeded
+	// the oldest attempts will be pruned to make room for new attempts.
+	MaxAllowedAttempts = 10
+	// maxQueuedTransactions is the max limit of UnstartedTransactions and ConfirmedTransactions structures.
+	maxQueuedTransactions = 250
+	// pruneSubset controls the subset of confirmed transactions to prune when the structure reaches its max limit.
+	// i.e. if the value is 3 and the limit is 90, 30 transactions will be pruned.
+	pruneSubset              = 3
+	pruneUnstartedTxDuration = 2 * time.Hour
+)
+
+type InMemoryStore struct {
+	sync.RWMutex
+	lggr      logger.Logger
+	txIDCount uint64
+	address   common.Address
+	chainID   *big.Int
+
+	UnstartedTransactions   []*types.Transaction
+	UnconfirmedTransactions map[uint64]*types.Transaction
+	ConfirmedTransactions   map[uint64]*types.Transaction
+	FatalTransactions       []*types.Transaction
+
+	Transactions map[uint64]*types.Transaction
+}
+
+func NewInMemoryStore(lggr logger.Logger, address common.Address, chainID *big.Int) *InMemoryStore {
+	return &InMemoryStore{
+		lggr:                    logger.Named(lggr, "InMemoryStore"),
+		address:                 address,
+		chainID:                 chainID,
+		UnstartedTransactions:   make([]*types.Transaction, 0, maxQueuedTransactions),
+		UnconfirmedTransactions: make(map[uint64]*types.Transaction),
+		ConfirmedTransactions:   make(map[uint64]*types.Transaction, maxQueuedTransactions),
+		Transactions:            make(map[uint64]*types.Transaction),
+	}
+}
+
+func (m *InMemoryStore) AbandonPendingTransactions() {
+	// TODO: append existing fatal transactions and cap the size
+	m.Lock()
+	defer m.Unlock()
+
+	for _, tx := range m.UnstartedTransactions {
+		tx.State = txmgr.TxFatalError
+	}
+	for _, tx := range m.FatalTransactions {
+		delete(m.Transactions, tx.ID)
+	}
+	m.FatalTransactions = m.UnstartedTransactions
+	m.UnstartedTransactions = []*types.Transaction{}
+
+	for _, tx := range m.UnconfirmedTransactions {
+		tx.State = txmgr.TxFatalError
+		m.FatalTransactions = append(m.FatalTransactions, tx)
+	}
+	m.UnconfirmedTransactions = make(map[uint64]*types.Transaction)
+}
+
+func (m *InMemoryStore) AppendAttemptToTransaction(txNonce uint64, attempt *types.Attempt) (attempts []*types.Attempt, err error) {
+	m.Lock()
+	defer m.Unlock()
+
+	tx, exists := m.UnconfirmedTransactions[txNonce]
+	if !exists {
+		return nil, fmt.Errorf("unconfirmed tx was not found for nonce: %d - txID: %v", txNonce, attempt.TxID)
+	}
+
+	if tx.ID != attempt.TxID {
+		return nil, fmt.Errorf("unconfirmed tx with nonce exists but attempt points to a different txID. Found Tx: %v - txID: %v", tx, attempt.TxID)
+	}
+
+	attempt.CreatedAt = time.Now()
+	attempt.ID = uint64(tx.AttemptCount) // Attempts are not collectively tracked by the in-memory store so attemptIDs are not unique between transactions and can be reused.
+	tx.AttemptCount++
+	// Prune oldest attempt.
+	if len(tx.Attempts) >= MaxAllowedAttempts {
+		m.UnconfirmedTransactions[txNonce].Attempts[0] = nil // avoid memory leaks
+		m.UnconfirmedTransactions[txNonce].Attempts = m.UnconfirmedTransactions[txNonce].Attempts[1:]
+	}
+	m.UnconfirmedTransactions[txNonce].Attempts = append(m.UnconfirmedTransactions[txNonce].Attempts, attempt.DeepCopy())
+
+	attempts = make([]*types.Attempt, len(tx.Attempts))
+	for i, a := range tx.Attempts {
+		attempts[i] = a.DeepCopy()
+	}
+	return attempts, nil
+}
+
+func (m *InMemoryStore) CountUnstartedTransactions() int {
+	m.RLock()
+	defer m.RUnlock()
+
+	return len(m.UnstartedTransactions)
+}
+
+func (m *InMemoryStore) CreateEmptyUnconfirmedTransaction(nonce uint64, gasLimit uint64) (*types.Transaction, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	emptyTx := &types.Transaction{
+		ID:                m.txIDCount,
+		ChainID:           m.chainID,
+		Nonce:             &nonce,
+		FromAddress:       m.address,
+		ToAddress:         common.Address{},
+		Value:             big.NewInt(0),
+		SpecifiedGasLimit: gasLimit,
+		CreatedAt:         time.Now(),
+		State:             txmgr.TxUnconfirmed,
+		IsPurgeable:       true,
+	}
+
+	if _, exists := m.UnconfirmedTransactions[nonce]; exists {
+		return nil, fmt.Errorf("an unconfirmed tx with the same nonce already exists: %v", m.UnconfirmedTransactions[nonce])
+	}
+
+	if _, exists := m.ConfirmedTransactions[nonce]; exists {
+		return nil, fmt.Errorf("a confirmed tx with the same nonce already exists: %v", m.ConfirmedTransactions[nonce])
+	}
+
+	m.txIDCount++
+	m.UnconfirmedTransactions[nonce] = emptyTx
+	m.Transactions[emptyTx.ID] = emptyTx
+
+	return emptyTx.DeepCopy(), nil
+}
+
+func (m *InMemoryStore) CreateTransaction(txRequest *types.TxRequest) *types.Transaction {
+	m.Lock()
+	defer m.Unlock()
+
+	tx := &types.Transaction{
+		ID:                m.txIDCount,
+		IdempotencyKey:    txRequest.IdempotencyKey,
+		ChainID:           m.chainID,
+		FromAddress:       m.address,
+		ToAddress:         txRequest.ToAddress,
+		Value:             txRequest.Value,
+		Data:              txRequest.Data,
+		SpecifiedGasLimit: txRequest.SpecifiedGasLimit,
+		CreatedAt:         time.Now(),
+		State:             txmgr.TxUnstarted,
+		Meta:              txRequest.Meta,
+		MinConfirmations:  txRequest.MinConfirmations,
+		PipelineTaskRunID: txRequest.PipelineTaskRunID,
+		SignalCallback:    txRequest.SignalCallback,
+	}
+
+	uLen := len(m.UnstartedTransactions)
+	if uLen >= maxQueuedTransactions {
+		m.lggr.Warnw(fmt.Sprintf("Unstarted transactions queue for address: %v reached max limit of: %d. Dropping oldest transactions", m.address, maxQueuedTransactions),
+			"txs", m.UnstartedTransactions[0:uLen-maxQueuedTransactions+1]) // need to make room for the new tx
+		for i, tx := range m.UnstartedTransactions[0 : uLen-maxQueuedTransactions+1] {
+			delete(m.Transactions, tx.ID)
+			m.UnstartedTransactions[i] = nil // avoid memory leaks
+		}
+		m.UnstartedTransactions = m.UnstartedTransactions[uLen-maxQueuedTransactions+1:]
+	}
+
+	m.txIDCount++
+	txCopy := tx.DeepCopy()
+	m.Transactions[txCopy.ID] = txCopy
+	m.UnstartedTransactions = append(m.UnstartedTransactions, txCopy)
+	return tx
+}
+
+func (m *InMemoryStore) FetchUnconfirmedTransactionAtNonceWithCount(latestNonce uint64) (txCopy *types.Transaction, unconfirmedCount int) {
+	m.RLock()
+	defer m.RUnlock()
+
+	tx := m.UnconfirmedTransactions[latestNonce]
+	if tx != nil {
+		txCopy = tx.DeepCopy()
+	}
+	unconfirmedCount = len(m.UnconfirmedTransactions)
+	return
+}
+
+func (m *InMemoryStore) FetchUnconfirmedTransactions() ([]*types.Transaction, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	transactions := make([]*types.Transaction, 0, len(m.UnconfirmedTransactions))
+	for _, tx := range m.UnconfirmedTransactions {
+		if tx.Nonce == nil {
+			return nil, fmt.Errorf("unconfirmed transaction with ID %d has nil nonce", tx.ID)
+		}
+		transactions = append(transactions, tx.DeepCopy())
+	}
+
+	// Sort by nonce in ascending order
+	sort.Slice(transactions, func(i, j int) bool {
+		return *transactions[i].Nonce < *transactions[j].Nonce
+	})
+
+	return transactions, nil
+}
+
+func (m *InMemoryStore) MarkConfirmedAndReorgedTransactions(latestNonce uint64) ([]*types.Transaction, []uint64, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	var confirmedTransactions []*types.Transaction
+	for _, tx := range m.UnconfirmedTransactions {
+		if tx.Nonce == nil {
+			return nil, nil, fmt.Errorf("nonce for txID: %v is empty", tx.ID)
+		}
+		existingTx, exists := m.ConfirmedTransactions[*tx.Nonce]
+		if exists {
+			m.lggr.Errorw("Another confirmed transaction with the same nonce exists. Transaction will be overwritten.",
+				"existingTx", existingTx, "newTx", tx)
+		}
+		if *tx.Nonce < latestNonce {
+			tx.State = txmgr.TxConfirmed
+			confirmedTransactions = append(confirmedTransactions, tx.DeepCopy())
+			m.ConfirmedTransactions[*tx.Nonce] = tx
+			delete(m.UnconfirmedTransactions, *tx.Nonce)
+		}
+	}
+
+	var unconfirmedTransactionIDs []uint64
+	for _, tx := range m.ConfirmedTransactions {
+		if tx.Nonce == nil {
+			return nil, nil, fmt.Errorf("nonce for txID: %v is empty", tx.ID)
+		}
+		existingTx, exists := m.UnconfirmedTransactions[*tx.Nonce]
+		if exists {
+			m.lggr.Errorw("Another unconfirmed transaction with the same nonce exists. Transaction will be overwritten.",
+				"existingTx", existingTx, "newTx", tx)
+		}
+		if *tx.Nonce >= latestNonce {
+			tx.State = txmgr.TxUnconfirmed
+			tx.LastBroadcastAt = nil // Mark reorged transaction as if it wasn't broadcasted before
+			unconfirmedTransactionIDs = append(unconfirmedTransactionIDs, tx.ID)
+			m.UnconfirmedTransactions[*tx.Nonce] = tx
+			delete(m.ConfirmedTransactions, *tx.Nonce)
+		}
+	}
+
+	if len(m.ConfirmedTransactions) > maxQueuedTransactions {
+		prunedTxIDs := m.pruneConfirmedTransactions()
+		m.lggr.Debugf("Confirmed transactions map for address: %v reached max limit of: %d. Pruned 1/%d of the oldest confirmed transactions. TxIDs: %v",
+			m.address, maxQueuedTransactions, pruneSubset, prunedTxIDs)
+	}
+	sort.Slice(confirmedTransactions, func(i, j int) bool { return confirmedTransactions[i].ID < confirmedTransactions[j].ID })
+	slices.Sort(unconfirmedTransactionIDs)
+	return confirmedTransactions, unconfirmedTransactionIDs, nil
+}
+
+func (m *InMemoryStore) MarkUnconfirmedTransactionPurgeable(nonce uint64) error {
+	m.Lock()
+	defer m.Unlock()
+
+	tx, exists := m.UnconfirmedTransactions[nonce]
+	if !exists {
+		return fmt.Errorf("unconfirmed tx with nonce: %d was not found", nonce)
+	}
+
+	tx.IsPurgeable = true
+
+	return nil
+}
+
+func (m *InMemoryStore) UpdateTransactionBroadcast(txID uint64, txNonce uint64, attemptHash common.Hash) error {
+	m.Lock()
+	defer m.Unlock()
+
+	unconfirmedTx, exists := m.UnconfirmedTransactions[txNonce]
+	if !exists {
+		return fmt.Errorf("unconfirmed tx was not found for nonce: %d - txID: %v", txNonce, txID)
+	}
+
+	// Set the same time for both the tx and its attempt
+	now := time.Now()
+	unconfirmedTx.LastBroadcastAt = &now
+	if unconfirmedTx.InitialBroadcastAt == nil {
+		unconfirmedTx.InitialBroadcastAt = &now
+	}
+	a, err := unconfirmedTx.FindAttemptByHash(attemptHash)
+	if err != nil {
+		return fmt.Errorf("UpdateTransactionBroadcast failed to find attempt. %w", err)
+	}
+	a.BroadcastAt = &now
+
+	return nil
+}
+
+// Shouldn't call lock because it's being called by a method that already has the lock
+func (m *InMemoryStore) pruneUnstartedTransactionsWithinDuration(threshold time.Duration) (txIDsToPrune []uint64) {
+	for i, tx := range m.UnstartedTransactions {
+		if time.Since(tx.CreatedAt) < threshold {
+			m.UnstartedTransactions = m.UnstartedTransactions[i:]
+			return txIDsToPrune
+		}
+		txIDsToPrune = append(txIDsToPrune, tx.ID)
+		delete(m.Transactions, tx.ID)
+		m.UnstartedTransactions[i] = nil // prevent memory leak
+	}
+	m.UnstartedTransactions = m.UnstartedTransactions[:0]
+	return
+}
+
+func (m *InMemoryStore) UpdateUnstartedTransactionWithNonce(nonce uint64) (*types.Transaction, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	prunedTxIDs := m.pruneUnstartedTransactionsWithinDuration(pruneUnstartedTxDuration)
+	if len(prunedTxIDs) != 0 {
+		m.lggr.Debugf("Unstarted transactions map for address: %v exceeds cutoff time of: %s. Pruned %d oldest unstarted transactions. TxIDs: %v",
+			m.address, pruneUnstartedTxDuration, len(prunedTxIDs), prunedTxIDs)
+	}
+	if len(m.UnstartedTransactions) == 0 {
+		m.lggr.Debugf("Unstarted transactions queue is empty for address: %v", m.address)
+		return nil, nil
+	}
+	if tx, exists := m.UnconfirmedTransactions[nonce]; exists {
+		return nil, fmt.Errorf("an unconfirmed tx with the same nonce already exists: %v", tx)
+	}
+
+	tx := m.UnstartedTransactions[0]
+	tx.Nonce = &nonce
+	tx.State = txmgr.TxUnconfirmed
+
+	m.UnstartedTransactions = m.UnstartedTransactions[1:]
+	m.UnconfirmedTransactions[nonce] = tx
+
+	return tx.DeepCopy(), nil
+}
+
+// Shouldn't call lock because it's being called by a method that already has the lock
+func (m *InMemoryStore) pruneConfirmedTransactions() []uint64 {
+	noncesToPrune := make([]uint64, 0, len(m.ConfirmedTransactions))
+	for nonce := range m.ConfirmedTransactions {
+		noncesToPrune = append(noncesToPrune, nonce)
+	}
+	if len(noncesToPrune) == 0 {
+		return nil
+	}
+	slices.Sort(noncesToPrune)
+	minNonce := noncesToPrune[len(noncesToPrune)/pruneSubset]
+
+	var txIDsToPrune []uint64
+	for nonce, tx := range m.ConfirmedTransactions {
+		if nonce < minNonce {
+			txIDsToPrune = append(txIDsToPrune, tx.ID)
+			delete(m.Transactions, tx.ID)
+			delete(m.ConfirmedTransactions, nonce)
+		}
+	}
+
+	slices.Sort(txIDsToPrune)
+	return txIDsToPrune
+}
+
+// Error Handler
+func (m *InMemoryStore) DeleteAttemptForUnconfirmedTx(transactionNonce uint64, attempt *types.Attempt) error {
+	m.Lock()
+	defer m.Unlock()
+
+	tx, exists := m.UnconfirmedTransactions[transactionNonce]
+	if !exists {
+		return fmt.Errorf("unconfirmed tx was not found for nonce: %d - txID: %v", transactionNonce, attempt.TxID)
+	}
+
+	for i, a := range tx.Attempts {
+		if a.Hash == attempt.Hash {
+			tx.Attempts = append(tx.Attempts[:i], tx.Attempts[i+1:]...)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("attempt with hash: %v for txID: %v was not found", attempt.Hash, attempt.TxID)
+}
+
+func (m *InMemoryStore) MarkTxFatal(txToMark *types.Transaction) error {
+	m.Lock()
+	defer m.Unlock()
+
+	// TODO: for now do the simple thing and drop the transaction instead of adding it to the fatal queue.
+	delete(m.UnconfirmedTransactions, *txToMark.Nonce)
+	delete(m.Transactions, txToMark.ID)
+	txToMark.State = txmgr.TxFatalError // update the state in case the caller needs to log
+	return nil
+}
+
+func (m *InMemoryStore) UpdateSignedAttempt(txID uint64, attemptID uint64, signedTransaction *evmtypes.Transaction) error {
+	m.Lock()
+	defer m.Unlock()
+
+	tx, exists := m.Transactions[txID]
+	if !exists {
+		return fmt.Errorf("tx was not found for txID: %v", txID)
+	}
+
+	for _, attempt := range tx.Attempts {
+		if attempt.ID == attemptID {
+			attempt.SignedTransaction = signedTransaction
+			return nil
+		}
+	}
+	return fmt.Errorf("attempt was not found for attemptID: %v", attemptID)
+}
+
+// Orchestrator
+func (m *InMemoryStore) FindTxWithIdempotencyKey(idempotencyKey string) *types.Transaction {
+	m.RLock()
+	defer m.RUnlock()
+
+	for _, tx := range m.Transactions {
+		if tx.IdempotencyKey != nil && *tx.IdempotencyKey == idempotencyKey {
+			return tx.DeepCopy()
+		}
+	}
+
+	return nil
+}

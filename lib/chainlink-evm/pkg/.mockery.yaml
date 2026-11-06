@@ -1,0 +1,120 @@
+dir: "{{ .InterfaceDir }}/mocks"
+mockname: "{{ .InterfaceName }}"
+outpkg: mocks
+filename: "{{ .InterfaceName | snakecase }}.go"
+fail-on-missing: true
+packages:
+  github.com/smartcontractkit/chainlink-framework/chains/heads:
+    config:
+      dir: heads/headstest
+      outpkg: headstest
+    interfaces:
+      Trackable:
+      Tracker:
+      Broadcaster:
+  github.com/smartcontractkit/chainlink-evm/pkg/client:
+    config:
+      dir: client/clienttest
+      outpkg: clienttest
+    interfaces:
+      Client:
+  github.com/smartcontractkit/chainlink-evm/pkg/config:
+    interfaces:
+      GasEstimator:
+      ChainScopedConfig:
+      EVM:
+      Workflow:
+      LimitJobType:
+  github.com/smartcontractkit/chainlink-evm/pkg/gas:
+    interfaces:
+      EvmFeeEstimator:
+      FeeEstimatorClient:
+        config:
+          mockname: FeeEstimatorClient
+      feeHistoryEstimatorClient:
+        config:
+          mockname: FeeHistoryEstimatorClient
+      EvmEstimator:
+  github.com/smartcontractkit/chainlink-evm/pkg/gas/rollups:
+    interfaces:
+      L1Oracle:
+      l1OracleClient:
+        config:
+          mockname: L1OracleClient
+  github.com/smartcontractkit/chainlink-evm/pkg/monitor:
+    interfaces:
+      BalanceMonitor:
+  github.com/smartcontractkit/chainlink-framework/multinode:
+    config:
+      dir: client/clienttest
+      outpkg: clienttest
+    interfaces:
+      Subscription:
+  github.com/smartcontractkit/chainlink-evm/pkg/txm:
+    config:
+      dir: txm
+      outpkg: txm
+      mockname: "Mock{{ .InterfaceName }}"
+      filename: "mock_{{ .InterfaceName | snakecase }}_test.go"
+    interfaces:
+      Client:
+      TxStore:
+      AttemptBuilder:
+  github.com/smartcontractkit/chainlink-framework/chains/txmgr:
+    config:
+      dir: txmgr/mocks
+    interfaces:
+      TxManager:
+  github.com/smartcontractkit/chainlink-framework/chains/txmgr/types:
+    config:
+      dir: txmgr/mocks
+    interfaces:
+      TxStrategy:
+  github.com/smartcontractkit/chainlink-evm/pkg/txmgr:
+    interfaces:
+      EvmTxStore:
+      ChainReceipt:
+  github.com/smartcontractkit/chainlink-evm/pkg/log:
+    interfaces:
+      AbigenContract:
+      Broadcaster:
+      Broadcast:
+  github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm:
+    interfaces:
+      Chain:
+  github.com/smartcontractkit/chainlink-common/pkg/beholder:
+    config:
+      dir: txm/
+      outpkg: txm
+      mockname: "mock{{ .InterfaceName }}"
+      filename: "mock_{{ .InterfaceName | snakecase }}_test.go"
+    interfaces:
+      Emitter:
+  github.com/smartcontractkit/chainlink-evm/pkg/logpoller:
+    interfaces:
+      LogPoller:
+      ORM:
+        config:
+          dir: "{{ .InterfaceDir }}"
+          outpkg: logpoller
+          filename: "mock_orm_test.go"
+          mockname: "MockORM"
+          inpackage: true
+  github.com/smartcontractkit/chainlink-evm/pkg/round:
+    interfaces:
+      RequestRoundDB:
+  github.com/smartcontractkit/chainlink-evm/pkg/read:
+    config:
+      dir: "{{ .InterfaceDir }}/mocks"
+    interfaces:
+      Registrar:
+      Reader:
+      BatchCaller:
+  github.com/smartcontractkit/chainlink-common/pkg/types:
+    interfaces:
+      Codec:
+        config:
+          dir: read/mocks
+  github.com/smartcontractkit/chainlink-evm/pkg/keys:
+    interfaces:
+      AddressLister:

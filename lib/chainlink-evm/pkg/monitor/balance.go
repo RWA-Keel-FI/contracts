@@ -1,0 +1,258 @@
+package monitor
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"math/big"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils"
+	"github.com/smartcontractkit/chainlink-evm/pkg/keys"
+	"github.com/smartcontractkit/chainlink-framework/chains/heads"
+	"github.com/smartcontractkit/chainlink-framework/metrics"
+
+	"github.com/smartcontractkit/chainlink-evm/gethwrappers/shared/generated/latest/erc20"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	evmclient "github.com/smartcontractkit/chainlink-evm/pkg/client"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+)
+
+type (
+	HeadTrackable = heads.Trackable[*evmtypes.Head, common.Hash]
+	// BalanceMonitor checks the balance for each key on every new head
+	BalanceMonitor interface {
+		HeadTrackable
+		GetEthBalance(common.Address) *assets.Eth
+		services.Service
+	}
+
+	balanceMonitor struct {
+		services.Service
+		eng *services.Engine
+
+		ethClient      evmclient.Client
+		chainIDStr     string
+		balanceMetrics metrics.GenericBalanceMetrics
+		ethKeyStore    keys.AddressLister
+		ethBalances    map[common.Address]*assets.Eth
+		ethBalancesMtx sync.RWMutex
+		sleeperTask    *utils.SleeperTask
+		tokenCaller    *erc20.ERC20Caller
+		tokenDecimals  uint8
+	}
+
+	NullBalanceMonitor struct{}
+)
+
+var _ BalanceMonitor = (*balanceMonitor)(nil)
+
+// NewBalanceMonitor returns a new balanceMonitor. If tokenAddress is non-nil, the monitor checks
+// the balance of that ERC-20 token instead of the chain's native balance.
+func NewBalanceMonitor(ethClient evmclient.Client, ethKeyStore keys.AddressLister, lggr logger.Logger, tokenAddress *common.Address) (*balanceMonitor, error) {
+	balanceMetrics, err := metrics.NewGenericBalanceMetrics(metrics.EVM, ethClient.ConfiguredChainID().String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create balance metrics: %w", err)
+	}
+
+	bm := &balanceMonitor{
+		ethClient:      ethClient,
+		chainIDStr:     ethClient.ConfiguredChainID().String(),
+		balanceMetrics: balanceMetrics,
+		ethKeyStore:    ethKeyStore,
+		ethBalances:    make(map[common.Address]*assets.Eth),
+	}
+	if tokenAddress != nil {
+		bm.tokenCaller, err = erc20.NewERC20Caller(*tokenAddress, ethClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create ERC-20 token caller: %w", err)
+		}
+	}
+	bm.Service, bm.eng = services.Config{
+		Name:  "BalanceMonitor",
+		Start: bm.start,
+		Close: bm.close,
+	}.NewServiceEngine(lggr)
+	bm.sleeperTask = utils.NewSleeperTaskCtx(&worker{bm: bm})
+	return bm, nil
+}
+
+func (bm *balanceMonitor) start(ctx context.Context) error {
+	if bm.tokenCaller != nil {
+		decimals, err := bm.tokenCaller.Decimals(&bind.CallOpts{Context: ctx})
+		if err != nil {
+			return fmt.Errorf("failed to get ERC-20 token decimals: %w", err)
+		}
+		bm.tokenDecimals = decimals
+	}
+	// Always query latest balance on start
+	(&worker{bm}).Work(ctx)
+	return nil
+}
+
+// Close shuts down the BalanceMonitor, should not be used after this
+func (bm *balanceMonitor) close() error {
+	return bm.sleeperTask.Stop()
+}
+
+// OnNewLongestChain checks the balance for each key
+func (bm *balanceMonitor) OnNewLongestChain(_ context.Context, _ *evmtypes.Head) {
+	bm.eng.Debugw("BalanceMonitor: signalling balance worker")
+	ok := bm.sleeperTask.WakeUpIfStarted()
+	if !ok {
+		bm.eng.Debugw("BalanceMonitor: ignoring OnNewLongestChain call, balance monitor is not started", "state", bm.sleeperTask.State())
+	}
+}
+
+func (bm *balanceMonitor) updateBalance(ctx context.Context, ethBal assets.Eth, address common.Address) {
+	bm.updateBalanceMetrics(ctx, &ethBal, address)
+
+	bm.ethBalancesMtx.Lock()
+	oldBal := bm.ethBalances[address]
+	bm.ethBalances[address] = &ethBal
+	bm.ethBalancesMtx.Unlock()
+
+	lgr := logger.Named(bm.eng, "BalanceLog")
+	lgr = logger.With(lgr,
+		"address", address.Hex(),
+		"ethBalance", ethBal.String(),
+		"weiBalance", ethBal.ToInt())
+
+	if oldBal == nil {
+		lgr.Infof("ETH balance for %s: %s", address.Hex(), ethBal.String())
+		return
+	}
+
+	if ethBal.Cmp(oldBal) != 0 {
+		lgr.Infof("New ETH balance for %s: %s", address.Hex(), ethBal.String())
+	}
+}
+
+func (bm *balanceMonitor) GetEthBalance(address common.Address) *assets.Eth {
+	bm.ethBalancesMtx.RLock()
+	defer bm.ethBalancesMtx.RUnlock()
+	return bm.ethBalances[address]
+}
+
+// Deprecated: use github.com/smartcontractkit/chainlink-framework/metrics.AccountBalance instead.
+var promETHBalance = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "eth_balance",
+		Help: "Each Ethereum account's balance",
+	},
+	[]string{"account", "evmChainID"},
+)
+
+func (bm *balanceMonitor) updateBalanceMetrics(ctx context.Context, balance *assets.Eth, from common.Address) {
+	balanceFloat, err := ApproximateFloat64(balance)
+	if err != nil {
+		bm.eng.Error(fmt.Errorf("updatePrometheusEthBalance: %w", err))
+		return
+	}
+
+	bm.balanceMetrics.RecordNodeBalance(ctx, from.Hex(), balanceFloat)
+	// TODO: Remove deprecated metric
+	promETHBalance.WithLabelValues(from.Hex(), bm.chainIDStr).Set(balanceFloat)
+}
+
+type worker struct {
+	bm *balanceMonitor
+}
+
+func (*worker) Name() string {
+	return "BalanceMonitorWorker"
+}
+
+func (w *worker) Work(ctx context.Context) {
+	enabledAddresses, err := w.bm.ethKeyStore.EnabledAddresses(ctx)
+	if err != nil {
+		w.bm.eng.Error("BalanceMonitor: error getting keys", err)
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(len(enabledAddresses))
+	for _, address := range enabledAddresses {
+		go func(k common.Address) {
+			defer wg.Done()
+			w.checkAccountBalance(ctx, k)
+		}(address)
+	}
+	wg.Wait()
+}
+
+func (w *worker) checkAccountBalance(ctx context.Context, address common.Address) {
+	var bal *big.Int
+	var err error
+	if w.bm.tokenCaller != nil {
+		bal, err = w.bm.tokenCaller.BalanceOf(&bind.CallOpts{Context: ctx}, address)
+		if err == nil && bal != nil {
+			bal = scaleToWei(bal, w.bm.tokenDecimals)
+		}
+	} else {
+		bal, err = w.bm.ethClient.BalanceAt(ctx, address, nil)
+	}
+	if err != nil {
+		w.bm.eng.Errorw("BalanceMonitor: error getting balance for key "+address.Hex(),
+			"err", err,
+			"address", address,
+		)
+	} else if bal == nil {
+		w.bm.eng.Errorw(fmt.Sprintf("BalanceMonitor: error getting balance for key %s: invariant violation, bal may not be nil", address.Hex()),
+			"err", err,
+			"address", address,
+		)
+	} else {
+		ethBal := assets.Eth(*bal)
+		w.bm.updateBalance(ctx, ethBal, address)
+	}
+}
+
+func (*NullBalanceMonitor) GetEthBalance(common.Address) *assets.Eth {
+	return nil
+}
+
+// Start does noop for NullBalanceMonitor.
+func (*NullBalanceMonitor) Start(context.Context) error                                { return nil }
+func (*NullBalanceMonitor) Close() error                                               { return nil }
+func (*NullBalanceMonitor) Ready() error                                               { return nil }
+func (*NullBalanceMonitor) OnNewLongestChain(ctx context.Context, head *evmtypes.Head) {}
+
+// weiDecimals is the number of decimals assets.Eth values are denominated in.
+const weiDecimals = 18
+
+// scaleToWei normalizes a raw ERC-20 balance reported with the given number of decimals to an
+// 18-decimal (wei-equivalent) value, so it can be stored and reported as assets.Eth alongside
+// native balances. Tokens with fewer than 18 decimals are scaled up; tokens with more than 18
+// decimals are scaled down and truncated.
+func scaleToWei(bal *big.Int, decimals uint8) *big.Int {
+	switch {
+	case decimals < weiDecimals:
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(weiDecimals-decimals)), nil)
+		return new(big.Int).Mul(bal, factor)
+	case decimals > weiDecimals:
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals-weiDecimals)), nil)
+		return new(big.Int).Quo(bal, factor)
+	default:
+		return bal
+	}
+}
+
+func ApproximateFloat64(e *assets.Eth) (float64, error) {
+	ef := new(big.Float).SetInt(e.ToInt())
+	weif := new(big.Float).SetInt(evmtypes.WeiPerEth)
+	bf := new(big.Float).Quo(ef, weif)
+	f64, _ := bf.Float64()
+	if f64 == math.Inf(1) || f64 == math.Inf(-1) {
+		return math.Inf(1), pkgerrors.New("assets.Eth.Float64: Could not approximate Eth value into float")
+	}
+	return f64, nil
+}

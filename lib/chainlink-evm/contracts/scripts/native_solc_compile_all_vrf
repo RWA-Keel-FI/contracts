@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+
+set -e
+
+echo " ┌──────────────────────────────────────────────┐"
+echo " │          Compiling VRF contracts...          │"
+echo " └──────────────────────────────────────────────┘"
+
+PROJECT="vrf"
+CONTRACTS_DIR="$( cd "$(dirname "$0")" >/dev/null 2>&1 ; cd ../ && pwd -P )"
+
+compileContract() {
+  local contract=$(basename "$2")
+  echo "Compiling" "$contract"
+
+  local optimizer_override=""
+  if [[ -n $3 ]]; then
+    optimizer_override="--optimizer-runs $3"
+  fi
+
+  local command
+  command="env FOUNDRY_PROFILE=$1 forge build $CONTRACTS_DIR/src/v0.8/$PROJECT/$2.sol \
+   --root $CONTRACTS_DIR \
+   --extra-output-files bin abi \
+   $optimizer_override \
+   -o $CONTRACTS_DIR/solc/$PROJECT/$contract"
+  $command
+
+  # Copy the generated abi files to a single folder
+  mkdir -p "$CONTRACTS_DIR"/abi/v0.8/"$PROJECT"
+  cp "$CONTRACTS_DIR"/solc/$PROJECT/"$contract"/"$contract".sol/"$contract".abi.json "$CONTRACTS_DIR"/abi/v0.8/"$PROJECT"/"$contract".abi.json
+}
+
+# VRF Helpers
+compileContract vrf-compile testhelpers/ChainSpecificUtilHelper
+compileContract vrf-compile testhelpers/VRFTestHelper
+
+# VRF Consumers and Mocks
+compileContract vrf-compile testhelpers/VRFMockETHLINKAggregator
+compileContract vrf-compile testhelpers/Counter
+
+# VRF V2 Plus
+compileContract vrfv2plus-compile interfaces/IVRFCoordinatorV2PlusInternal
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusConsumerExample
+compileContract vrfv2plus-compile VRFCoordinatorV2_5 500
+compileContract vrfv2plus-compile VRFCoordinatorV2_5_Arbitrum 500
+compileContract vrfv2plus-compile VRFCoordinatorV2_5_Optimism 500
+compileContract vrfv2plus-compile BatchVRFCoordinatorV2Plus
+compileContract vrfv2plus-compile VRFV2PlusWrapper
+compileContract vrfv2plus-compile VRFV2PlusWrapper_Arbitrum
+compileContract vrfv2plus-compile VRFV2PlusWrapper_Optimism
+compileContract vrfv2plus-compile testhelpers/VRFConsumerV2PlusUpgradeableExample
+compileContract vrfv2plus-compile testhelpers/VRFMaliciousConsumerV2Plus
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusExternalSubOwnerExample
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusSingleConsumerExample
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusWrapperConsumerExample
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusRevertingExample
+compileContract vrfv2plus-compile testhelpers/VRFConsumerV2PlusUpgradeableExample
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusMaliciousMigrator
+compileContract vrfv2plus-compile testhelpers/VRFCoordinatorTestV2_5 500
+compileContract vrfv2plus-compile libraries/VRFV2PlusClient
+compileContract vrfv2plus-compile testhelpers/VRFCoordinatorV2Plus_V2Example
+compileContract vrfv2plus-compile TrustedBlockhashStore
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusLoadTestWithMetrics
+compileContract vrfv2plus-compile testhelpers/VRFCoordinatorV2PlusUpgradedVersion 5
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusWrapperLoadTestConsumer
+compileContract vrfv2plus-compile testhelpers/VRFMockETHLINKAggregator
+compileContract vrfv2plus-compile testhelpers/VRFV2PlusLoadTestWithMetrics
+compileContract vrfv2plus-compile BatchBlockhashStore
+compileContract vrfv2plus-compile BlockhashStore

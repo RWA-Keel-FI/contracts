@@ -1,0 +1,40 @@
+name: Run golangci-lint
+
+on: [pull_request]
+
+jobs:
+  golangci-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    env:
+      ALLOW_FAILURE: ${{ contains(join(github.event.pull_request.labels.*.name, ' '), 'allow-lint-issues') }}
+    steps:
+      - name: Setup tar default options
+        shell: bash
+        # Do not overwrite existing files when extracting files from a cache archive.
+        # Since actions/cache does not support this option, we set it here as a default.
+        run: echo "TAR_OPTIONS=--skip-old-files" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          cache-dependency-path: go.sum
+          go-version-file: go.mod
+
+      - name: Run golangci-lint
+        if: ${{ env.ALLOW_FAILURE != 'true' }}
+        uses: smartcontractkit/.github/actions/ci-lint-go@ci-lint-go/v4 # ci-lint-go/v4
+        with:
+          golangci-lint-version: v2.14.0
+          only-new-issues: true
+          go-directory: pkg
+
+      - name: Skip golangci-lint (allow-lint-issues)
+        if: ${{ env.ALLOW_FAILURE == 'true' }}
+        run: echo "Skipping golangci-lint because PR has the allow-lint-issues label"
