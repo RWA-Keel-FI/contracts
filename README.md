@@ -63,7 +63,7 @@ Deployed on the real infrastructure of Arc Testnet: the existing Uniswap v4 `Poo
 | `SwapRouter` | `0xAeAb87E3a16f980f69267F6002B21cb9CFc36d4A` |
 | `LiquidityRouter` | `0xFF6d2be7c1128d42Fba72401ce974436336674c7` |
 
-Explorer: <https://explorer.testnet.arc.network>
+Explorer: <https://explorer.testnet.arc.io>
 
 Two `tTSLA/USDC` pools were initialized at the live TSLA price ($358.22, the last traded price when it was deployed on a Friday evening) and seeded with about 12 USDC of liquidity in wide, medium and tight ranges:
 
