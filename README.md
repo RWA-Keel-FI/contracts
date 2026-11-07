@@ -70,6 +70,20 @@ Two `tTSLA/USDC` pools were initialized at the live TSLA price ($358.22, the las
 - **Hook pool** `0x8da9612899aac68e58409d29419ca36966ab5cf3e41ca9d2334f6c55a7c64aed`: dynamic fee, uses the hook.
 - **Control pool** `0x9ee74a05d558a48e026d5259bd2cb2d43759d4643dc9bb2517fd98992b5a4cb6`: the same pair with a static 30 bps fee and no hook, for paired comparison.
 
+### Stocks (all mock tokens, all on the same hook and issuer)
+
+TSLA, NVDA, AAPL, GOOGL and META each have a mock `t<TICKER>` token, a hook pool and a control pool. Every pool holds a small amount of liquidity (wide, medium and tight ranges). The first oracle price for NVDA, AAPL, GOOGL and META was also written by the deployer while it was the temporary forwarder (same bootstrap as TSLA), and the oracle was then handed back to Chainlink's production forwarder.
+
+| Token | Address | Hook pool | Control pool |
+|---|---|---|---|
+| `tTSLA` | `0x7910aEb89f4843457d90cb26161EebA34d39EB60` | `0x8da96128…c64aed` | `0x9ee74a05…5a4cb6` |
+| `tNVDA` | `0xf9B947A1d5bD8abfED4D9b729A0AEaA726228fE6` | `0x4562aa9c…d838b7` | `0x31deac17…6e1f80` |
+| `tAAPL` | `0x0dfCeF65A9b4E44252B288adCaA526ed1d2A0b20` | `0xa0afa7e9…0966e7` | `0x8c9b3e0b…7a3cf5` |
+| `tGOOGL` | `0x8cF28B53990CA7071a60A9E9c83fcCf7e0f6F746` | `0xb917e4a9…10a2f6` | `0xf77b191b…2cd264` |
+| `tMETA` | `0xE53762Ac95105ed68D7384E8e1b76c3e16ba5C4A` | `0xddab7666…ba989c` | `0xe3267fc4…67f579` |
+
+Full pool IDs are in `deployments/arc-testnet.json` (copied into the client repo at `client/deployments/`).
+
 ### What the on-chain demo showed
 
 | Step | Pool | Fee paid | Tx |

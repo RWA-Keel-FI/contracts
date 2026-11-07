@@ -1,6 +1,6 @@
 # DeviationFee — contracts architecture
 
-Status: **prototype, unaudited, never deployed.** 44/44 Foundry tests pass (`forge test`), see §9 for what that does and does not cover.
+Status: **prototype, unaudited, deployed on Arc Testnet (chain 5042002; addresses in README.md).** 80 Foundry tests pass (`forge test`), see §9 for what that does and does not cover.
 
 ## 1. What it does
 
@@ -193,8 +193,8 @@ hook-address/flag validation, orientation × decimals (18/18, 18/6, both sides),
 oracle (forwarder-only, store/emit, replay/future/zero ignored, ERC-165), math fuzz (round trip, bounds, monotonicity, never-above-`d/2`).
 
 NOT covered / not done:
-* Chainlink's real `KeystoneForwarder`/DON signatures — only a local `MockForwarder` (the real one is Chainlink's code, and needs a deployed workflow).
-* Fork tests, deployed addresses, Unichain Sepolia deployment, the CREATE2 deploy script (mining is only dry-run in a test).
+* Chainlink's real `KeystoneForwarder`/DON signatures are not exercised by the tests (they use a local `MockForwarder`). On Arc Testnet the oracle trusts the production KeystoneForwarder, but no CRE workflow is deployed on the network yet, so no report has arrived through it.
+* Fork tests inside Foundry (Arc's USDC uses chain precompiles Foundry cannot simulate; the deploy was rehearsed on an anvil fork with a stand-in USDC, then run on Arc Testnet by `server/scripts/deploy-arc.sh`).
 * Multi-swap / chunking simulations and any economic backtest (the parent analysis did that off-chain, statically).
 * Gas figure is warm-ish; the cold number is an estimate.
 * No audit; no formal verification; `HookMiner` comes from `v4-periphery/test/shared`, not a released package.
